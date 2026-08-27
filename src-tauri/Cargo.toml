@@ -26,5 +26,13 @@ rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 subtle = "2"
 
+# The installable GitHub APK uses the hardened Android debug variant for
+# automatic signing. Keep its native core optimized and free of debug symbols.
+[profile.dev]
+opt-level = 2
+debug = 0
+strip = "symbols"
+incremental = false
+
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"
