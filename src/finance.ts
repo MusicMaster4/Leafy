@@ -1,0 +1,40 @@
+import { eachDayOfInterval, format, isAfter, parseISO, startOfDay, subDays } from 'date-fns'
+import type { Transaction } from './types'
+
+export const money = (value: number, compact = false) =>
+  new Intl.NumberFormat('pt-BR', {
+    style: 'currency', currency: 'BRL',
+    notation: compact ? 'compact' : 'standard',
+    maximumFractionDigits: compact ? 1 : 2,
+  }).format(value)
+
+export function summarize(transactions: Transaction[]) {
+  const income = transactions.filter(t => t.type === 'income').reduce((sum, t) => sum + t.amount, 0)
+  const expenses = transactions.filter(t => t.type === 'expense').reduce((sum, t) => sum + t.amount, 0)
+  return { income, expenses, balance: income - expenses, savingsRate: income ? ((income - expenses) / income) * 100 : 0 }
+}
+
+export function lastDays(transactions: Transaction[], days: number) {
+  const start = startOfDay(subDays(new Date(), days - 1))
+  return transactions.filter(t => !isAfter(start, parseISO(t.date)))
+}
+
+export function dailySeries(transactions: Transaction[], days = 30) {
+  const start = startOfDay(subDays(new Date(), days - 1))
+  const interval = eachDayOfInterval({ start, end: new Date() })
+  return interval.map(day => {
+    const key = format(day, 'yyyy-MM-dd')
+    const daily = transactions.filter(t => t.date === key)
+    return {
+      date: format(day, 'dd/MM'),
+      receitas: daily.filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0),
+      gastos: daily.filter(t => t.type === 'expense').reduce((s, t) => s + t.amount, 0),
+    }
+  })
+}
+
+export function categorySeries(transactions: Transaction[]) {
+  const grouped = new Map<string, number>()
+  transactions.filter(t => t.type === 'expense').forEach(t => grouped.set(t.category, (grouped.get(t.category) || 0) + t.amount))
+  return [...grouped.entries()].map(([name, value]) => ({ name, value })).sort((a, b) => b.value - a.value)
+}
