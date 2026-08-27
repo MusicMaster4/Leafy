@@ -148,7 +148,7 @@ jobs:
       - name: Build installable APK
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
-        run: npm run tauri android build -- --debug --apk
+        run: npm run tauri android build -- --debug --apk --target aarch64
       - name: Android lint
         working-directory: src-tauri/gen/android
         run: |
@@ -157,7 +157,7 @@ jobs:
       - name: Stage APK
         run: |
           mkdir release-assets
-          APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -1)
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk/arm64/debug -type f -name '*.apk' | head -1)
           test -n "$APK"
           if [ "${{ needs.version.outputs.channel }}" = "testing" ]; then
             cp "$APK" release-assets/leafy-beta.apk
