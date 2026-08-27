@@ -157,8 +157,10 @@ jobs:
       - name: Stage APK
         run: |
           mkdir release-assets
-          APK=$(find src-tauri/gen/android/app/build/outputs/apk/arm64/debug -type f -name '*.apk' | head -1)
-          test -n "$APK"
+          mapfile -t APKS < <(find src-tauri/gen/android/app/build -type f -path '*/outputs/apk/*' -name '*.apk' ! -path '*/androidTest/*' | sort)
+          printf 'Discovered APK: %s\n' "${APKS[@]}"
+          test "${#APKS[@]}" -eq 1
+          APK="${APKS[0]}"
           if [ "${{ needs.version.outputs.channel }}" = "testing" ]; then
             cp "$APK" release-assets/leafy-beta.apk
           else
