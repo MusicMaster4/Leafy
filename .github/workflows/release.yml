@@ -137,6 +137,12 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            src-tauri/gen/android/*.gradle*
+            src-tauri/gen/android/gradle.properties
+            src-tauri/gen/android/**/build.gradle.kts
+            src-tauri/gen/android/gradle/wrapper/gradle-wrapper.properties
       - uses: android-actions/setup-android@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Android toolchain
