@@ -15,12 +15,14 @@ jobs:
     name: Typecheck and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "24"
           cache: npm
       - run: npm ci
+      - run: npm run icons:verify
+      - run: npm run android:share:verify
       - run: npm test
       - run: npm run build
 
@@ -28,7 +30,7 @@ jobs:
     name: Rust check
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Tauri system dependencies
         run: |
           sudo apt-get update

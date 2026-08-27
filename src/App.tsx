@@ -1,7 +1,7 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react'
+import { createContext, FormEvent, useContext, useEffect, useMemo, useState } from 'react'
 import {
   ArrowDownRight, ArrowLeftRight, ArrowUpRight, Bell, ChevronDown, CircleDollarSign,
-  Eye, EyeOff, KeyRound, LayoutDashboard, Leaf, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
+  AlertTriangle, Eye, EyeOff, FileCheck2, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
   ReceiptText, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Trash2, TrendingUp, Unplug,
   WalletCards, WandSparkles, X,
 } from 'lucide-react'
@@ -14,8 +14,14 @@ import { format, parseISO } from 'date-fns'
 import { enUS } from 'date-fns/locale'
 import { categorySeries, dailySeries, lastDays, money, parseAmount, summarize } from './finance'
 import { demoTransactions } from './data'
-import { expenseCategories, incomeCategories, type Transaction, type TransactionType } from './types'
-import { categorizeWithAi, configureOpenRouter } from './ai'
+import {
+  currencies, currencyDetails, expenseCategories, incomeCategories, isCurrencyCode,
+  type CurrencyCode, type Transaction, type TransactionType,
+} from './types'
+import { categorizeWithAi, configureOpenRouter, localCategory } from './ai'
+import leafyIcon from '../src-tauri/icons/app-icon.svg'
+import { secureGet, secureSet } from './storage'
+import { analyzeReceipt, isSharedReceipt, type SharedReceipt } from './receipt'
 import {
   createPairing, forgetPeer, mergeTransactions, parsePairing, pullFromPeer, pushToPeer,
   rememberPeer, savedPeer, scanPairingCode, serializePairing, type PairingDetails,
@@ -26,35 +32,56 @@ const COLORS: Record<string, string> = {
   Health: '#62b978', Shopping: '#9b79d1', Subscriptions: '#4b9fc3', Other: '#82948a',
 }
 
+const CurrencyContext = createContext<CurrencyCode>('BRL')
+const useCurrency = () => useContext(CurrencyContext)
+
 function useTransactions() {
-  const [transactions, setTransactions] = useState<Transaction[]>(() => {
-    try {
-      const saved = localStorage.getItem('leafy-transactions') ?? localStorage.getItem('lumina-transactions')
-      if (saved) return JSON.parse(saved)
-      return new URLSearchParams(window.location.search).has('demo') ? demoTransactions : []
-    } catch { return [] }
-  })
-  useEffect(() => localStorage.setItem('leafy-transactions', JSON.stringify(transactions)), [transactions])
-  return [transactions, setTransactions] as const
+  const [transactions, setTransactions] = useState<Transaction[]>([])
+  const [ready, setReady] = useState(false)
+  const [storageError, setStorageError] = useState(false)
+  useEffect(() => {
+    void (async () => {
+      try {
+        let rows = await secureGet<Transaction[]>('transactions')
+        if (!rows) {
+          const legacy = localStorage.getItem('leafy-transactions') ?? localStorage.getItem('lumina-transactions')
+          rows = legacy ? JSON.parse(legacy) as Transaction[] : new URLSearchParams(window.location.search).has('demo') ? demoTransactions : []
+          await secureSet('transactions', rows)
+          localStorage.removeItem('leafy-transactions')
+          localStorage.removeItem('lumina-transactions')
+        }
+        setTransactions(rows)
+      } catch {
+        setStorageError(true)
+      } finally { setReady(true) }
+    })()
+  }, [])
+  useEffect(() => {
+    if (ready && !storageError) void secureSet('transactions', transactions).catch(() => setStorageError(true))
+  }, [ready, storageError, transactions])
+  return [transactions, setTransactions, ready, storageError] as const
 }
 
 function StatCard({ label, value, type, note, hidden }: { label: string; value: number; type: 'balance' | 'income' | 'expense'; note: string; hidden?: boolean }) {
   const Icon = type === 'income' ? ArrowUpRight : type === 'expense' ? ArrowDownRight : WalletCards
+  const currency = useCurrency()
   return (
     <div className={`stat-card ${type}`}>
       <div className="stat-top"><span>{label}</span><span className="stat-icon"><Icon size={18} /></span></div>
-      <strong>{hidden ? 'R$ •••••' : money(value)}</strong>
+      <strong>{hidden ? `${currencyDetails(currency).symbol} •••••` : money(value, false, currency)}</strong>
       <small>{note}</small>
     </div>
   )
 }
 
 function CustomTooltip({ active, payload, label }: any) {
+  const currency = useCurrency()
   if (!active || !payload?.length) return null
-  return <div className="chart-tooltip"><b>{label}</b>{payload.map((p: any) => <span key={p.name} style={{ color: p.color }}>{p.name}: {money(p.value)}</span>)}</div>
+  return <div className="chart-tooltip"><b>{label}</b>{payload.map((p: any) => <span key={p.name} style={{ color: p.color }}>{p.name}: {money(p.value, false, currency)}</span>)}</div>
 }
 
 function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: Transaction, useAi: boolean) => void }) {
+  const currency = useCurrency()
   const [type, setType] = useState<TransactionType>('expense')
   const [amount, setAmount] = useState('')
   const [description, setDescription] = useState('')
@@ -84,8 +111,8 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
           <button type="button" className={type === 'expense' ? 'active expense' : ''} onClick={() => setType('expense')}><ArrowDownRight size={17} /> Spent</button>
           <button type="button" className={type === 'income' ? 'active income' : ''} onClick={() => setType('income')}><ArrowUpRight size={17} /> Received</button>
         </div>
-        <label className="amount-field"><span>Amount</span><div><b>R$</b><input id="amount" inputMode="decimal" placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} /></div></label>
-        <label className="input-label"><span>Description <i>optional</i></span><input placeholder={type === 'expense' ? 'Example: lunch, groceries...' : 'Example: salary, freelance...'} value={description} onChange={e => setDescription(e.target.value)} /></label>
+        <label className="amount-field"><span>Amount</span><div><b>{currencyDetails(currency).symbol}</b><input id="amount" inputMode="decimal" maxLength={24} placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} /></div></label>
+        <label className="input-label"><span>Description <i>optional</i></span><input maxLength={200} placeholder={type === 'expense' ? 'Example: lunch, groceries...' : 'Example: salary, freelance...'} value={description} onChange={e => setDescription(e.target.value)} /></label>
         <div className="category-field"><span>Category</span><div className="category-chips"><button type="button" className={category === 'Auto' ? 'active auto' : ''} onClick={() => setCategory('Auto')}><WandSparkles size={12} /> Auto</button>{categories.map(item => <button type="button" className={category === item ? 'active' : ''} onClick={() => setCategory(item)} key={item}>{item}</button>)}</div>{category === 'Auto' && <small className="auto-hint">Leafy will categorize it with AI. Local matching is used when offline.</small>}</div>
         <button className={`save-button ${type}`} type="submit">Save {type === 'expense' ? 'expense' : 'income'} <span>↵</span></button>
         <p className="privacy-note">Stored only on this device</p>
@@ -94,15 +121,22 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
   )
 }
 
-function PreferencesPanel({ onClose, onNotice }: { onClose: () => void; onNotice: (message: string) => void }) {
+function PreferencesPanel({ currency, onCurrencyChange, onClose, onNotice }: {
+  currency: CurrencyCode
+  onCurrencyChange: (currency: CurrencyCode) => Promise<void>
+  onClose: () => void
+  onNotice: (message: string) => void
+}) {
   const [key, setKey] = useState('')
+  const [selectedCurrency, setSelectedCurrency] = useState<CurrencyCode>(currency)
   const [saving, setSaving] = useState(false)
   const save = async (event: FormEvent) => {
     event.preventDefault()
     setSaving(true)
     try {
-      await configureOpenRouter(key)
-      onNotice('OpenRouter connected for this session')
+      await onCurrencyChange(selectedCurrency)
+      if (key.trim()) await configureOpenRouter(key)
+      onNotice(key.trim() ? 'Preferences saved and OpenRouter connected' : 'Preferences saved')
       onClose()
     } catch (error) {
       onNotice(error instanceof Error ? error.message : 'OpenRouter is available in the desktop and mobile apps')
@@ -110,11 +144,70 @@ function PreferencesPanel({ onClose, onNotice }: { onClose: () => void; onNotice
   }
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry preferences-panel" onSubmit={save}>
-      <div className="entry-head"><div><span className="eyebrow">PREFERENCES</span><h2>AI categorization</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
+      <div className="entry-head"><div><span className="eyebrow">PREFERENCES</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
+      <label className="input-label"><span>Display currency</span><select value={selectedCurrency} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
       <div className="privacy-callout"><KeyRound size={20}/><div><b>Your key stays on this device</b><span>Leafy sends only the transaction description to OpenRouter when Auto is selected. The key is held in app memory and is never committed or synced.</span></div></div>
-      <label className="input-label"><span>OpenRouter API key</span><input type="password" autoComplete="off" placeholder="sk-or-v1-..." value={key} onChange={event => setKey(event.target.value)} /></label>
-      <button className="save-button income" disabled={saving || !key.trim()}>{saving ? 'Connecting...' : 'Connect OpenRouter'}</button>
+      <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder="sk-or-v1-..." value={key} onChange={event => setKey(event.target.value)} /></label>
+      <button className="save-button income" disabled={saving}>{saving ? 'Saving...' : 'Save preferences'}</button>
       <p className="privacy-note">You can also set OPENROUTER_API_KEY before launching Leafy.</p>
+    </form>
+  </div>
+}
+
+function ReceiptReview({ source, onClose, onAdd }: {
+  source: SharedReceipt
+  onClose: () => void
+  onAdd: (row: Transaction, useAi: boolean) => void
+}) {
+  const currency = useCurrency()
+  const detected = useMemo(() => analyzeReceipt(source.text), [source])
+  const [type, setType] = useState<TransactionType>(detected.type)
+  const [amount, setAmount] = useState(detected.amount?.toFixed(2) ?? '')
+  const [description, setDescription] = useState(detected.description)
+  const [date, setDate] = useState(detected.date)
+  const [category, setCategory] = useState('Auto')
+  const categories = type === 'expense' ? expenseCategories : incomeCategories
+  const currencyMismatch = detected.currency !== null && detected.currency !== currency
+
+  useEffect(() => setCategory('Auto'), [type])
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault()
+    const value = parseAmount(amount)
+    if (!value || value <= 0) return
+    onAdd({
+      id: crypto.randomUUID(),
+      type,
+      amount: value,
+      description: description.trim() || (type === 'expense' ? 'Receipt payment' : 'Receipt income'),
+      category: category === 'Auto' ? localCategory(description, type) : category,
+      date,
+    }, false)
+  }
+
+  return <div className="modal-backdrop receipt-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+    <form className="quick-entry receipt-review" onSubmit={submit}>
+      <div className="entry-head">
+        <div><span className="eyebrow">SHARED RECEIPT</span><h2>Review before saving</h2></div>
+        <button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button>
+      </div>
+      <div className="receipt-source"><FileCheck2 size={20}/><div><b>{source.name}</b><span>Read locally on this device</span></div><em className={detected.confidence}>{detected.confidence} confidence</em></div>
+      <div className={`receipt-explanation ${detected.confidence}`}>
+        {detected.confidence === 'low' && <AlertTriangle size={18}/>}<span>{detected.explanation}</span>
+      </div>
+      {currencyMismatch && <div className="receipt-explanation low"><AlertTriangle size={18}/><span>This receipt appears to use {detected.currency}, but your ledger uses {currency}. Change the display currency in Preferences before saving; Leafy does not guess exchange rates.</span></div>}
+      <div className="type-switch">
+        <button type="button" className={type === 'expense' ? 'active expense' : ''} onClick={() => setType('expense')}><ArrowDownRight size={17}/> Spent</button>
+        <button type="button" className={type === 'income' ? 'active income' : ''} onClick={() => setType('income')}><ArrowUpRight size={17}/> Received</button>
+      </div>
+      <div className="receipt-fields">
+        <label className="input-label"><span>Amount ({currencyDetails(currency).symbol})</span><input required inputMode="decimal" maxLength={24} value={amount} onChange={event => setAmount(event.target.value)}/></label>
+        <label className="input-label"><span>Date</span><input required type="date" value={date} onChange={event => setDate(event.target.value)}/></label>
+      </div>
+      <label className="input-label"><span>Description</span><input required maxLength={200} value={description} onChange={event => setDescription(event.target.value)}/></label>
+      <div className="category-field"><span>Category</span><div className="category-chips"><button type="button" className={category === 'Auto' ? 'active auto' : ''} onClick={() => setCategory('Auto')}><WandSparkles size={12}/> Auto (local)</button>{categories.map(item => <button type="button" className={category === item ? 'active' : ''} onClick={() => setCategory(item)} key={item}>{item}</button>)}</div></div>
+      <button className={`save-button ${type}`} type="submit" disabled={currencyMismatch}>Confirm and save {type === 'expense' ? 'expense' : 'income'}</button>
+      <p className="privacy-note">Nothing changes until you confirm. Receipt contents are not sent to OpenRouter.</p>
     </form>
   </div>
 }
@@ -136,7 +229,7 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
     setBusy(true); setStatus('Starting a private local connection...')
     try {
       const next = await createPairing(transactions)
-      setPeer(next); onPaired(next); setStatus('Ready. Scan this code with Leafy on your phone.')
+      await rememberPeer(next); setPeer(next); onPaired(next); setStatus('Ready for one hour. Scan this code with Leafy on your phone.')
     } catch { setStatus('Open Leafy as a desktop app to create a pairing code.') }
     finally { setBusy(false) }
   }
@@ -146,7 +239,7 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
     try {
       const next = details ?? parsePairing(pairingText.trim())
       const rows = await pullFromPeer(next)
-      rememberPeer(next); setPeer(next); onPaired(next); onMerge(rows)
+      await rememberPeer(next); setPeer(next); onPaired(next); onMerge(rows)
       setStatus(`Connected. Imported ${rows.length} transactions.`)
     } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not connect') }
     finally { setBusy(false) }
@@ -165,9 +258,9 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
       <div className="entry-head"><div><span className="eyebrow">PRIVATE SYNC</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')}><Smartphone size={16}/> This phone</button></div>
       {mode === 'show' ? <div className="sync-content">
-        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={190} level="M" bgColor="#f3fff8" fgColor="#10251b" /></div><p>Open Leafy on your phone, choose <b>Devices</b>, then scan this code.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
+        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={240} level="L" bgColor="#f3fff8" fgColor="#10251b" /></div><p>Open Leafy on your phone, choose <b>Devices</b>, then scan this code.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
       </div> : <div className="sync-content scan-content">
-        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>The QR code carries a one-time address and a 256-bit encryption key. Your financial data stays encrypted in transit.</p>
+        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>The time-limited QR carries a pinned TLS certificate and a separate 256-bit encryption key. Your financial data remains end-to-end encrypted.</p>
         <button className="scan-button" onClick={scanCode} disabled={busy}><QrCode size={17}/>{busy ? 'Opening camera...' : 'Scan QR code'}</button>
         <div className="manual-code"><span>or paste the pairing link</span><input aria-label="Pairing link" placeholder="leafy://pair?..." value={pairingText} onChange={event => setPairingText(event.target.value)}/><button onClick={() => connect()} disabled={!pairingText.trim() || busy}>Connect</button></div>
       </div>}
@@ -178,13 +271,15 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
 }
 
 export default function App() {
-  const [transactions, setTransactions] = useTransactions()
+  const [transactions, setTransactions, storageReady, storageError] = useTransactions()
   const [days, setDays] = useState(30)
   const [showBalance, setShowBalance] = useState(true)
   const [entryOpen, setEntryOpen] = useState(false)
   const [preferencesOpen, setPreferencesOpen] = useState(false)
   const [syncOpen, setSyncOpen] = useState(false)
-  const [peer, setPeer] = useState<PairingDetails | null>(() => savedPeer())
+  const [sharedReceipt, setSharedReceipt] = useState<SharedReceipt | null>(null)
+  const [currency, setCurrency] = useState<CurrencyCode>('BRL')
+  const [peer, setPeer] = useState<PairingDetails | null>(null)
   const [search, setSearch] = useState('')
   const [toast, setToast] = useState('')
   const periodRows = useMemo(() => lastDays(transactions, days), [transactions, days])
@@ -199,6 +294,33 @@ export default function App() {
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7)
 
   useEffect(() => {
+    void secureGet<unknown>('currency').then(value => {
+      if (isCurrencyCode(value)) setCurrency(value)
+    }).catch(() => setToast('Currency preference could not be unlocked. Using BRL.'))
+  }, [])
+
+  useEffect(() => {
+    const bridgeWindow = window as Window & { __leafyShareReady?: boolean }
+    const receive = (event: Event) => {
+      const value = (event as CustomEvent<unknown>).detail
+      if (isSharedReceipt(value)) setSharedReceipt(value)
+      else setToast('Leafy rejected an invalid shared receipt.')
+    }
+    const receiveError = (event: Event) => {
+      const value = (event as CustomEvent<{ message?: unknown }>).detail
+      setToast(typeof value?.message === 'string' ? value.message : 'Leafy could not read this shared receipt.')
+    }
+    bridgeWindow.__leafyShareReady = true
+    window.addEventListener('leafy:shared-receipt', receive)
+    window.addEventListener('leafy:share-error', receiveError)
+    return () => {
+      bridgeWindow.__leafyShareReady = false
+      window.removeEventListener('leafy:shared-receipt', receive)
+      window.removeEventListener('leafy:share-error', receiveError)
+    }
+  }, [])
+
+  useEffect(() => {
     const key = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) setEntryOpen(true)
       if (event.key === 'Escape') setEntryOpen(false)
@@ -208,7 +330,22 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (storageError) setToast('Private storage could not be unlocked. Changes will not be saved.')
+  }, [storageError])
+
+  useEffect(() => {
+    void savedPeer().then(setPeer)
+  }, [])
+
+  useEffect(() => {
     if (!peer) return
+    const remaining = Date.parse(peer.expiresAt) - Date.now()
+    const timer = window.setTimeout(() => { forgetPeer(); setPeer(null) }, Math.max(0, remaining))
+    return () => window.clearTimeout(timer)
+  }, [peer])
+
+  useEffect(() => {
+    if (!peer || !storageReady) return
     const sync = async () => {
       try {
         const incoming = await pullFromPeer(peer)
@@ -221,15 +358,19 @@ export default function App() {
     sync()
     const timer = window.setInterval(sync, 5000)
     return () => window.clearInterval(timer)
-  }, [peer, setTransactions])
+  }, [peer, setTransactions, storageReady])
 
   useEffect(() => {
-    if (!peer) return
+    if (!peer || !storageReady) return
     const timer = window.setTimeout(() => pushToPeer(peer, transactions).catch(() => undefined), 700)
     return () => window.clearTimeout(timer)
-  }, [peer, transactions])
+  }, [peer, transactions, storageReady])
 
   const add = async (row: Transaction, useAi: boolean) => {
+    if (storageError) {
+      setToast('Unlock private storage before adding transactions.')
+      return
+    }
     setTransactions(current => [row, ...current])
     setEntryOpen(false)
     setToast(row.type === 'expense' ? 'Expense saved' : 'Income saved')
@@ -241,12 +382,15 @@ export default function App() {
       window.setTimeout(() => setToast(''), 2600)
     }
   }
-  const remove = (id: string) => setTransactions(current => current.filter(t => t.id !== id))
+  const remove = (id: string) => storageError
+    ? setToast('Unlock private storage before changing transactions.')
+    : setTransactions(current => current.filter(t => t.id !== id))
 
   return (
+    <CurrencyContext.Provider value={currency}>
     <div className="app-shell">
       <aside>
-        <div className="brand"><span className="brand-mark"><Leaf size={21} /></span><div>Leafy<small>MONEY, SIMPLIFIED</small></div></div>
+        <div className="brand"><img className="brand-mark" src={leafyIcon} alt="" /><div>Leafy<small>MONEY, SIMPLIFIED</small></div></div>
         <nav>
           <button className="active"><LayoutDashboard size={19} />Overview</button>
           <button><ArrowLeftRight size={19} />Transactions</button>
@@ -254,7 +398,7 @@ export default function App() {
           <button onClick={() => setSyncOpen(true)}><QrCode size={19} />Devices <span className="device-dot">{peer ? '1' : ''}</span></button>
         </nav>
         <div className="side-bottom">
-          <div className="weekly-card"><span className="mini-icon"><TrendingUp size={16} /></span><div><small>Spent in 7 days</small><b>{money(weekSpend)}</b></div></div>
+          <div className="weekly-card"><span className="mini-icon"><TrendingUp size={16} /></span><div><small>Spent in 7 days</small><b>{money(weekSpend, false, currency)}</b></div></div>
           <button className="settings" onClick={() => setPreferencesOpen(true)}><Settings size={18} />Preferences</button>
           <div className="profile"><span>M</span><div><b>My money</b><small>Local data</small></div><MoreHorizontal size={18} /></div>
         </div>
@@ -283,7 +427,7 @@ export default function App() {
             <div className="chart-wrap">
               <ResponsiveContainer width="100%" height="100%"><AreaChart data={chart} margin={{ left: -18, right: 8, top: 12 }}>
                 <defs><linearGradient id="incomeFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#2b9c7b" stopOpacity={0.24}/><stop offset="1" stopColor="#2b9c7b" stopOpacity={0}/></linearGradient><linearGradient id="expenseFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#e26846" stopOpacity={0.18}/><stop offset="1" stopColor="#e26846" stopOpacity={0}/></linearGradient></defs>
-                <CartesianGrid vertical={false} stroke="#ebe8df" strokeDasharray="4 5" /><XAxis dataKey="date" tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} interval={Math.max(0, Math.floor(days / 6) - 1)} /><YAxis tickFormatter={v => money(v, true)} tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip content={<CustomTooltip />} />
+                <CartesianGrid vertical={false} stroke="#ebe8df" strokeDasharray="4 5" /><XAxis dataKey="date" tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} interval={Math.max(0, Math.floor(days / 6) - 1)} /><YAxis tickFormatter={v => money(v, true, currency)} tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip content={<CustomTooltip />} />
                 <Area type="monotone" dataKey="income" stroke="#5ed39f" strokeWidth={2.5} fill="url(#incomeFill)" dot={false} activeDot={{ r: 5, strokeWidth: 3, stroke: '#0f1d17' }} />
                 <Area type="monotone" dataKey="expenses" stroke="#e47b68" strokeWidth={2.5} fill="url(#expenseFill)" dot={false} activeDot={{ r: 5, strokeWidth: 3, stroke: '#0f1d17' }} />
               </AreaChart></ResponsiveContainer>
@@ -292,7 +436,7 @@ export default function App() {
 
           <article className="panel category-panel">
             <div className="panel-head"><div><span className="eyebrow">WHERE IT WENT</span><h2>Expenses by category</h2></div><button className="icon-button" aria-label="More options"><MoreHorizontal size={20} /></button></div>
-            {categories.length ? <><div className="donut-wrap"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={categories} dataKey="value" innerRadius={58} outerRadius={81} paddingAngle={3} stroke="none">{categories.map(item => <Cell key={item.name} fill={COLORS[item.name] || COLORS.Other} />)}</Pie><Tooltip formatter={value => money(Number(value ?? 0))} /></PieChart></ResponsiveContainer><div className="donut-center"><small>TOTAL</small><b>{money(summary.expenses, true)}</b></div></div><div className="category-list">{categories.slice(0, 4).map(item => <div key={item.name}><span><i style={{ background: COLORS[item.name] || COLORS.Other }} />{item.name}</span><b>{summary.expenses ? ((item.value / summary.expenses) * 100).toFixed(0) : 0}%</b></div>)}</div></> : <div className="empty-chart">No expenses in this period</div>}
+            {categories.length ? <><div className="donut-wrap"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={categories} dataKey="value" innerRadius={58} outerRadius={81} paddingAngle={3} stroke="none">{categories.map(item => <Cell key={item.name} fill={COLORS[item.name] || COLORS.Other} />)}</Pie><Tooltip formatter={value => money(Number(value ?? 0), false, currency)} /></PieChart></ResponsiveContainer><div className="donut-center"><small>TOTAL</small><b>{money(summary.expenses, true, currency)}</b></div></div><div className="category-list">{categories.slice(0, 4).map(item => <div key={item.name}><span><i style={{ background: COLORS[item.name] || COLORS.Other }} />{item.name}</span><b>{summary.expenses ? ((item.value / summary.expenses) * 100).toFixed(0) : 0}%</b></div>)}</div></> : <div className="empty-chart">No expenses in this period</div>}
           </article>
         </section>
 
@@ -302,7 +446,7 @@ export default function App() {
             <div className="transaction-list">{recent.map(row => <div className="transaction" key={row.id}>
               <span className={`transaction-icon ${row.type}`}>{row.type === 'income' ? <ArrowUpRight size={18} /> : <ReceiptText size={18} />}</span>
               <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}</span></div>
-              <strong className={row.type}>{row.type === 'income' ? '+' : '−'} {money(row.amount)}</strong>
+              <strong className={row.type}>{row.type === 'income' ? '+' : '−'} {money(row.amount, false, currency)}</strong>
               <button className="delete-button" onClick={() => remove(row.id)} aria-label={`Delete ${row.description}`}><Trash2 size={16} /></button>
             </div>)}</div>
           </article>
@@ -310,16 +454,24 @@ export default function App() {
           <article className="panel rhythm-panel">
             <div className="panel-head"><div><span className="eyebrow">SPENDING PACE</span><h2>Last 7 days</h2></div><span className="trend-badge">live</span></div>
             <div className="bar-wrap"><ResponsiveContainer width="100%" height="100%"><BarChart data={dailySeries(lastDays(transactions, 7), 7)}><XAxis dataKey="date" tick={{ fill: '#7f9489', fontSize: 10 }} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip />} cursor={{ fill: '#172820' }} /><Bar dataKey="expenses" fill="#5ed39f" radius={[6, 6, 2, 2]} maxBarSize={25}/></BarChart></ResponsiveContainer></div>
-            <div className="daily-avg"><span>Daily average</span><b>{money(weekSpend / 7)}</b></div>
+            <div className="daily-avg"><span>Daily average</span><b>{money(weekSpend / 7, false, currency)}</b></div>
           </article>
         </section>
       </main>
 
       <button className="mobile-fab" onClick={() => setEntryOpen(true)}><Plus size={23} /></button>
       {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} />}
-      {preferencesOpen && <PreferencesPanel onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
+      {preferencesOpen && <PreferencesPanel currency={currency} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
       {syncOpen && <SyncPanel transactions={transactions} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onMerge={rows => setTransactions(current => mergeTransactions(current, rows))} />}
+      {sharedReceipt && (
+        <ReceiptReview source={sharedReceipt} onClose={() => setSharedReceipt(null)} onAdd={(row, useAi) => {
+          if (storageError) { setToast('Unlock private storage before importing a receipt.'); return }
+          void add(row, useAi)
+          setSharedReceipt(null)
+        }}/>
+      )}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </div>
+    </CurrencyContext.Provider>
   )
 }

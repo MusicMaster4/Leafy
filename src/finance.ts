@@ -1,12 +1,14 @@
 import { eachDayOfInterval, format, isAfter, parseISO, startOfDay, subDays } from 'date-fns'
-import type { Transaction } from './types'
+import { currencyDetails, type CurrencyCode, type Transaction } from './types'
 
-export const money = (value: number, compact = false) =>
-  new Intl.NumberFormat('pt-BR', {
-    style: 'currency', currency: 'BRL',
+export const money = (value: number, compact = false, currency: CurrencyCode = 'BRL') => {
+  const details = currencyDetails(currency)
+  return new Intl.NumberFormat(details.locale, {
+    style: 'currency', currency,
     notation: compact ? 'compact' : 'standard',
     maximumFractionDigits: compact ? 1 : 2,
   }).format(value)
+}
 
 export function parseAmount(input: string) {
   const clean = input.trim().replace(/[^\d.,-]/g, '')

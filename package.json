@@ -5,17 +5,22 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/sync-android-icons.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
     "tauri": "tauri",
+    "icons:generate": "tauri icon src-tauri/icons/app-icon.svg",
+    "icons:sync": "node scripts/sync-android-icons.mjs",
+    "icons:verify": "node scripts/verify-icons.mjs",
+    "android:share:verify": "node scripts/verify-android-share.mjs",
     "version:next": "node scripts/release-version.mjs --dry-run"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
     "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
     "date-fns": "^4.1.0",
-    "lucide-react": "^0.468.0",
+    "lucide-react": "^1.34.0",
     "qrcode.react": "^4.2.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -26,7 +31,8 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^6.1.0",
-    "typescript": "^5.7.2",
+    "fake-indexeddb": "^6.2.5",
+    "typescript": "^7.0.2",
     "vite": "^8.2.2",
     "vitest": "^4.1.11"
   }
