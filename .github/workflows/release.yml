@@ -147,7 +147,9 @@ jobs:
       - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
       - name: Android lint
         working-directory: src-tauri/gen/android
-        run: ./gradlew lintArm64Debug
+        run: |
+          chmod +x gradlew
+          ./gradlew lintArm64Debug
       - name: Build installable APK
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
