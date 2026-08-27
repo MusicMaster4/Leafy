@@ -29,6 +29,7 @@ nav { display: grid; gap: 5px; }
 nav button, .settings { width: 100%; border: 0; background: transparent; color: #aebbb6; border-radius: 9px; padding: 11px 12px; display: flex; gap: 12px; align-items: center; text-align: left; font-size: 13px; font-weight: 600; cursor: pointer; }
 nav button:hover, .settings:hover { color: white; background: #15271f; }
 nav button.active { background: #193d2e; color: #7ce3b0; box-shadow: inset 3px 0 #63d6a3; }
+.dashboard-anchor { scroll-margin-top: 24px; }
 .soon { margin-left: auto; font-size: 7px; letter-spacing: .8px; color: #769083; background: #283b34; padding: 4px 5px; border-radius: 4px; }
 .device-dot { margin-left: auto; width: 17px; height: 17px; display: grid; place-items: center; border-radius: 50%; background: #24553e; color: #82e6b6; font-size: 8px; }
 .device-dot:empty { display: none; }

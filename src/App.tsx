@@ -1,4 +1,4 @@
-import { createContext, FormEvent, useContext, useEffect, useMemo, useState } from 'react'
+import { createContext, FormEvent, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowDownRight, ArrowLeftRight, ArrowUpRight, Bell, ChevronDown, CircleDollarSign,
   AlertTriangle, Eye, EyeOff, FileCheck2, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
@@ -34,6 +34,7 @@ const COLORS: Record<string, string> = {
 
 const CurrencyContext = createContext<CurrencyCode>('BRL')
 const useCurrency = () => useContext(CurrencyContext)
+type DashboardSection = 'overview' | 'transactions' | 'insights'
 
 function useTransactions() {
   const [transactions, setTransactions] = useState<Transaction[]>([])
@@ -282,6 +283,10 @@ export default function App() {
   const [peer, setPeer] = useState<PairingDetails | null>(null)
   const [search, setSearch] = useState('')
   const [toast, setToast] = useState('')
+  const [activeSection, setActiveSection] = useState<DashboardSection>('overview')
+  const overviewRef = useRef<HTMLElement>(null)
+  const transactionsRef = useRef<HTMLElement>(null)
+  const insightsRef = useRef<HTMLElement>(null)
   const periodRows = useMemo(() => lastDays(transactions, days), [transactions, days])
   const summary = useMemo(() => summarize(periodRows), [periodRows])
   const allSummary = useMemo(() => summarize(transactions), [transactions])
@@ -292,6 +297,12 @@ export default function App() {
   const recent = transactions
     .filter(t => `${t.description} ${t.category}`.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7)
+
+  const scrollToSection = (section: DashboardSection) => {
+    setActiveSection(section)
+    const target = section === 'overview' ? overviewRef.current : section === 'transactions' ? transactionsRef.current : insightsRef.current
+    target?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  }
 
   useEffect(() => {
     void secureGet<unknown>('currency').then(value => {
@@ -392,10 +403,10 @@ export default function App() {
       <aside>
         <div className="brand"><img className="brand-mark" src={leafyIcon} alt="" /><div>Leafy<small>MONEY, SIMPLIFIED</small></div></div>
         <nav>
-          <button className="active"><LayoutDashboard size={19} />Overview</button>
-          <button><ArrowLeftRight size={19} />Transactions</button>
-          <button><PieIcon size={19} />Insights</button>
-          <button onClick={() => setSyncOpen(true)}><QrCode size={19} />Devices <span className="device-dot">{peer ? '1' : ''}</span></button>
+          <button className={activeSection === 'overview' && !syncOpen ? 'active' : ''} aria-current={activeSection === 'overview' && !syncOpen ? 'page' : undefined} onClick={() => scrollToSection('overview')}><LayoutDashboard size={19} />Overview</button>
+          <button className={activeSection === 'transactions' && !syncOpen ? 'active' : ''} aria-current={activeSection === 'transactions' && !syncOpen ? 'page' : undefined} onClick={() => scrollToSection('transactions')}><ArrowLeftRight size={19} />Transactions</button>
+          <button className={activeSection === 'insights' && !syncOpen ? 'active' : ''} aria-current={activeSection === 'insights' && !syncOpen ? 'page' : undefined} onClick={() => scrollToSection('insights')}><PieIcon size={19} />Insights</button>
+          <button className={syncOpen ? 'active' : ''} aria-current={syncOpen ? 'page' : undefined} onClick={() => setSyncOpen(true)}><QrCode size={19} />Devices <span className="device-dot">{peer ? '1' : ''}</span></button>
         </nav>
         <div className="side-bottom">
           <div className="weekly-card"><span className="mini-icon"><TrendingUp size={16} /></span><div><small>Spent in 7 days</small><b>{money(weekSpend, false, currency)}</b></div></div>
@@ -405,7 +416,7 @@ export default function App() {
       </aside>
 
       <main>
-        <header>
+        <header ref={overviewRef}>
           <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting} <span>Let's check on your money.</span></h1></div>
           <div className="header-actions"><button className="icon-button" aria-label="Notifications"><Bell size={20} /></button><button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={19} />New transaction <kbd>N</kbd></button></div>
         </header>
@@ -421,7 +432,7 @@ export default function App() {
           <StatCard label="Expenses this period" value={summary.expenses} type="expense" note={`${periodRows.filter(t => t.type === 'expense').length} expenses recorded`} hidden={!showBalance} />
         </section>
 
-        <section className="charts-grid">
+        <section className="charts-grid dashboard-anchor" ref={insightsRef}>
           <article className="panel flow-panel">
             <div className="panel-head"><div><span className="eyebrow">MONEY FLOW</span><h2>Income and expenses</h2></div><span className="legend"><i className="income-dot" />Income <i className="expense-dot" />Expenses</span></div>
             <div className="chart-wrap">
@@ -440,7 +451,7 @@ export default function App() {
           </article>
         </section>
 
-        <section className="lower-grid">
+        <section className="lower-grid dashboard-anchor" ref={transactionsRef}>
           <article className="panel transactions-panel">
             <div className="panel-head"><div><span className="eyebrow">TRANSACTIONS</span><h2>Most recent</h2></div><label className="search"><Search size={16} /><input aria-label="Search transactions" placeholder="Search" value={search} onChange={e => setSearch(e.target.value)} /></label></div>
             <div className="transaction-list">{recent.map(row => <div className="transaction" key={row.id}>
