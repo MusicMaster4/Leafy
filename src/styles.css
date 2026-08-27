@@ -130,8 +130,10 @@ kbd { font: 600 9px DM Sans; padding: 2px 5px; border-radius: 4px; background: #
 .amount-field input { width: 100%; min-width: 0; border: 0; outline: 0; color: var(--ink); background: transparent; padding: 0 8px; font: 750 34px Manrope; letter-spacing: -1.5px; }
 .amount-field:focus-within > div { border-color: var(--green); }
 .input-label i { font-weight: 400; color: #a3a7a4; }
-.input-label input { border: 1px solid #294036; color: var(--ink); outline: 0; background: #0b1813; border-radius: 9px; padding: 11px 12px; font-size: 12px; }
-.input-label input:focus { border-color: #8ea69c; box-shadow: 0 0 0 3px #dce8e344; }
+.input-label input, .input-label select { width: 100%; border: 1px solid #294036; color: var(--ink); outline: 0; background: #0b1813; border-radius: 9px; padding: 11px 12px; font-size: 12px; }
+.input-label input:focus, .input-label select:focus { border-color: #8ea69c; box-shadow: 0 0 0 3px #dce8e344; }
+.input-label select { color-scheme: dark; cursor: pointer; }
+.input-label > small { color: #71877c; font-size: 9px; font-weight: 500; line-height: 1.4; }
 .category-chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .category-chips button { display: inline-flex; align-items: center; gap: 4px; }
 .category-chips button { border: 1px solid #294036; background: #0b1813; color: #8da097; border-radius: 20px; padding: 7px 10px; font-size: 10px; cursor: pointer; }
@@ -169,6 +171,20 @@ kbd { font: 600 9px DM Sans; padding: 2px 5px; border-radius: 4px; background: #
 .save-button.income { background: var(--green); color: #071b12; }
 .save-button span { float: right; opacity: .55; }
 .privacy-note { text-align: center; margin: 10px 0 0; color: #a0a5a1; font-size: 9px; }
+.receipt-review { width: min(520px, 100%); max-height: min(760px, calc(100vh - 32px)); overflow-y: auto; }
+.receipt-source { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 10px; margin-bottom: 12px; padding: 12px; border: 1px solid #294639; border-radius: 11px; background: #10251b; color: #68d9a5; }
+.receipt-source div { min-width: 0; display: grid; gap: 3px; }
+.receipt-source b { overflow: hidden; color: #dcebe4; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.receipt-source span { color: #789084; font-size: 9px; }
+.receipt-source em { padding: 5px 7px; border-radius: 20px; background: #1b3b2d; color: #83dfb4; font-size: 8px; font-style: normal; font-weight: 800; text-transform: uppercase; }
+.receipt-source em.medium { background: #3b3420; color: #dfc978; }
+.receipt-source em.low { background: #3b2822; color: #e39a88; }
+.receipt-explanation { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 16px; padding: 10px 11px; border-radius: 9px; background: #13291f; color: #8fb3a2; font-size: 10px; line-height: 1.45; }
+.receipt-explanation.low { background: #30231f; color: #ddb1a5; }
+.receipt-explanation svg { flex: 0 0 auto; }
+.receipt-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.receipt-fields .input-label { min-width: 0; }
+.receipt-review input[type="date"] { color-scheme: dark; }
 .toast { position: fixed; z-index: 30; left: 50%; bottom: 26px; transform: translateX(-50%); padding: 10px 15px; background: #1c3b2d; color: white; border: 1px solid #326049; border-radius: 10px; display: flex; gap: 9px; align-items: center; font-size: 12px; animation: rise .2s ease; }
 .toast span { color: #dced98; }
 .mobile-fab { display: none; }
@@ -218,6 +234,9 @@ kbd { font: 600 9px DM Sans; padding: 2px 5px; border-radius: 4px; background: #
   .transaction { grid-template-columns: 34px minmax(0,1fr) auto; }
   .delete-button { display: none; }
   .quick-entry { padding: 19px; border-radius: 15px; }
+  .receipt-fields { grid-template-columns: 1fr; gap: 0; }
+  .receipt-source { grid-template-columns: auto minmax(0, 1fr); }
+  .receipt-source em { grid-column: 2; justify-self: start; }
 }
 
 @media (prefers-reduced-motion: reduce) { *, *:before, *:after { animation: none !important; transition: none !important; } }

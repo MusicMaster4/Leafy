@@ -20,17 +20,21 @@ Your ledger lives on your device. There is no Leafy account and no shared databa
 
 - One-step income and expense entry, also available with the `N` shortcut
 - Balance, income, expenses, savings rate, and seven-day spending pace
+- Encrypted currency preference with BRL as the default, plus USD, EUR, and GBP
 - Line, bar, and category donut charts with 7, 30, and 90-day views
 - Optional AI categorization through your own OpenRouter key
 - Offline category matching when AI is unavailable
+- Android Share Sheet import for PDF, image, and plain-text receipts
+- On-device receipt OCR with a review step before any balance change
 - Private desktop-to-phone pairing by QR code
 - Responsive desktop and Android interface
 - Stable releases from `main` and beta releases from `testing`
 
 <table>
   <tr>
-    <td width="68%"><img src="docs/screenshots/leafy-dashboard.png" alt="Leafy dashboard with fictional finance data" /></td>
-    <td width="32%"><img src="docs/screenshots/leafy-mobile-entry.png" alt="Leafy quick expense entry on mobile" /></td>
+    <td width="58%"><img src="docs/screenshots/leafy-dashboard.png" alt="Leafy dashboard with fictional finance data" /></td>
+    <td width="21%"><img src="docs/screenshots/leafy-mobile-entry.png" alt="Leafy quick expense entry on mobile" /></td>
+    <td width="21%"><img src="docs/screenshots/leafy-mobile-receipt.png" alt="Leafy reviewing a fictional shared Pix receipt" /></td>
   </tr>
 </table>
 
@@ -73,6 +77,20 @@ npm run tauri dev
 
 The key is not written to the repository, paired to another device, or included in screenshots. You can choose a different OpenRouter model with `LEAFY_OPENROUTER_MODEL`. The default is `openrouter/auto`.
 
+## Share a receipt from Android
+
+Open a Pix receipt, payment PDF, screenshot, or plain-text confirmation in another Android app and choose **Share → Leafy**. Leafy appears as a system share target, reads the document on the phone, and proposes:
+
+- whether the money was spent or received
+- the amount and transaction date
+- a short description and local category
+
+Leafy always opens a review screen. It never changes the balance from an imported file until you confirm. PDFs are rendered in a private temporary directory, images and PDF pages use the bundled on-device OCR model, and temporary files are deleted after processing. Receipt contents are not sent to OpenRouter; imported receipts use local category matching by default.
+
+Incoming files are limited to 10 MB and 10 PDF pages. Leafy accepts secure Android `content://` shares for PDFs and images instead of requesting broad storage access.
+
+The receipt currency must match the ledger currency selected in Preferences. Leafy warns and blocks confirmation on a mismatch instead of silently treating reais as dollars or guessing an exchange rate.
+
 ## Private device sync
 
 The desktop app starts a one-hour HTTPS endpoint on a random port in your local network. Its self-signed certificate is pinned directly from the QR code, so Leafy never disables certificate or hostname verification. The QR carries independent secrets for transport authentication and content encryption:
@@ -87,8 +105,8 @@ The encryption key is never sent in a network request. The native client accepts
 
 | Branch | Channel | Version shape | GitHub release |
 | --- | --- | --- | --- |
-| `main` | Stable | `v0.1.0` | Latest release |
-| `testing` | Beta | `v0.1.1-testing.1` | Pre-release |
+| `main` | Stable | `vX.Y.Z` | Latest release |
+| `testing` | Beta | `vX.Y.Z-testing.N` | Pre-release |
 
 Only these branches publish builds. Every release includes Windows, macOS, Linux, and an installable Android APK. Pull requests and other branches run type checks, tests, the production web build, and a native Rust check without publishing anything.
 
@@ -104,7 +122,7 @@ cargo check --locked --manifest-path src-tauri/Cargo.toml
 ## Project map
 
 ```text
-src/                    React interface, charts, finance logic, sync crypto
+src/                    React interface, receipt analysis, charts, finance logic, sync crypto
 src-tauri/src/          Tauri commands, OpenRouter client, local sync server
 src-tauri/gen/android/  Generated Android Studio project
 scripts/                Branch-aware release versioning

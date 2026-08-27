@@ -8,7 +8,7 @@ Include the affected version, platform, reproduction steps, and the smallest saf
 
 ## Scope
 
-The most sensitive surfaces are local data storage, QR pairing, the local sync endpoint, OpenRouter key handling, and release artifacts. Leafy keeps an OpenRouter key in process memory for the app session. It is not persisted or synced.
+The most sensitive surfaces are local data storage, Android receipt sharing, QR pairing, the local sync endpoint, OpenRouter key handling, and release artifacts. Leafy keeps an OpenRouter key in process memory for the app session. It is not persisted or synced.
 
 ## Security model
 
@@ -18,9 +18,11 @@ The most sensitive surfaces are local data storage, QR pairing, the local sync e
 - A separate random 256-bit token authenticates requests. Sessions expire after one hour, accept only private IP destinations, reject redirects, and cap payloads at 5 MB.
 - The desktop sync server never receives the end-to-end encryption key and stores only ciphertext in memory.
 - Tauri runs with a restrictive content security policy and the Android app disables cleartext traffic and OS backup.
+- Android receipt import accepts only PDF, image, and plain-text share intents. File URIs are rejected in favor of temporary `content://` grants; inputs are capped at 10 MB and 10 PDF pages, decoded in private cache, and deleted after local OCR.
+- Imported receipts always require user confirmation. Their full contents are never submitted to OpenRouter, and local rules handle their default category.
 
 ## Limits
 
-No application can guarantee confidentiality after the operating system, an unlocked device, or the running Leafy process is fully compromised. The pairing QR contains session secrets; anyone who captures it while active may join that session. OpenRouter can read descriptions explicitly submitted for AI categorization, although it never receives amounts or the ledger from Leafy.
+No application can guarantee confidentiality after the operating system, an unlocked device, or the running Leafy process is fully compromised. A malicious or malformed document may still exploit an unknown vulnerability in Android's PDF renderer or the OCR library; size and page limits reduce, but cannot eliminate, that risk. The pairing QR contains session secrets; anyone who captures it while active may join that session. OpenRouter can read descriptions explicitly submitted through manual entry with `Auto` selected, although it never receives amounts or the ledger from Leafy.
 
 Automated checks include npm audit, RustSec, CodeQL for TypeScript and Rust, weekly dependency updates, unit tests, and release-source validation. These checks reduce risk but do not replace responsible disclosure or independent review.

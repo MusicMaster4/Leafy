@@ -22,6 +22,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run icons:verify
+      - run: npm run android:share:verify
       - run: npm test
       - run: npm run build
 

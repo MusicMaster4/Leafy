@@ -13,6 +13,7 @@
     "icons:generate": "tauri icon src-tauri/icons/app-icon.svg",
     "icons:sync": "node scripts/sync-android-icons.mjs",
     "icons:verify": "node scripts/verify-icons.mjs",
+    "android:share:verify": "node scripts/verify-android-share.mjs",
     "version:next": "node scripts/release-version.mjs --dry-run"
   },
   "dependencies": {

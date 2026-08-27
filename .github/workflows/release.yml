@@ -75,6 +75,7 @@ jobs:
           key: release-validation
       - run: npm ci
       - run: npm run icons:verify
+      - run: npm run android:share:verify
       - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
       - run: npm test
       - run: npm run build
@@ -144,6 +145,9 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
       - run: npm ci
       - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
+      - name: Android lint
+        working-directory: src-tauri/gen/android
+        run: ./gradlew lintArm64Debug
       - name: Build installable APK
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
