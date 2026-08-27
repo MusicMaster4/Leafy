@@ -1,3 +1,3 @@
 fn main() {
-    lumina_financas_lib::run()
+    leafy_financas_lib::run()
 }

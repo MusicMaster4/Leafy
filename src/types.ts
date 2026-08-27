@@ -9,5 +9,5 @@ export type Transaction = {
   date: string
 }
 
-export const expenseCategories = ['Alimentação', 'Moradia', 'Transporte', 'Lazer', 'Saúde', 'Compras', 'Assinaturas', 'Outros']
-export const incomeCategories = ['Salário', 'Freelance', 'Investimentos', 'Presente', 'Outros']
+export const expenseCategories = ['Food', 'Housing', 'Transport', 'Leisure', 'Health', 'Shopping', 'Subscriptions', 'Other']
+export const incomeCategories = ['Salary', 'Freelance', 'Investments', 'Gift', 'Other']

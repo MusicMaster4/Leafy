@@ -1,0 +1,180 @@
+name: Release
+
+on:
+  push:
+    branches: [main, testing]
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump from the newest stable release
+        type: choice
+        default: patch
+        options: [patch, minor, major]
+
+run-name: Leafy ${{ github.ref_name == 'main' && 'stable' || 'beta' }} release
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Resolve channel version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      channel: ${{ steps.version.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+      - id: version
+        run: node scripts/release-version.mjs --branch "$GITHUB_REF_NAME" --bump "${{ inputs.bump || 'patch' }}"
+      - name: Create release draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          CHANNEL: ${{ steps.version.outputs.channel }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          if [ "$CHANNEL" = "testing" ]; then
+            gh release create "$TAG" --draft --prerelease --title "Leafy $TAG (beta)" --generate-notes
+          else
+            gh release create "$TAG" --draft --title "Leafy $TAG" --generate-notes
+          fi
+
+  validate:
+    name: Validate release source
+    needs: version
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: release-validation
+      - run: npm ci
+      - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
+      - run: npm test
+      - run: npm run build
+      - run: cargo check --locked --manifest-path src-tauri/Cargo.toml
+
+  desktop:
+    name: Desktop (${{ matrix.platform }})
+    needs: [version, validate]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: --bundles nsis
+          - platform: ubuntu-22.04
+            args: --bundles deb,appimage
+          - platform: macos-latest
+            args: --bundles dmg
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf libfuse2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: release-${{ matrix.platform }}
+      - run: npm ci
+      - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ needs.version.outputs.tag }}
+          releaseName: Leafy ${{ needs.version.outputs.tag }}
+          releaseDraft: true
+          prerelease: ${{ needs.version.outputs.channel == 'testing' }}
+          args: ${{ matrix.args }}
+
+  android:
+    name: Android APK
+    needs: [version, validate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Android toolchain
+        run: |
+          sdkmanager "ndk;27.2.12479018"
+          rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
+      - run: npm ci
+      - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
+      - name: Build installable APK
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: npm run tauri android build -- --debug --apk
+      - name: Stage APK
+        run: |
+          mkdir release-assets
+          APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*.apk' | head -1)
+          test -n "$APK"
+          if [ "${{ needs.version.outputs.channel }}" = "testing" ]; then
+            cp "$APK" release-assets/leafy-beta.apk
+          else
+            cp "$APK" release-assets/leafy.apk
+          fi
+      - name: Upload APK to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.version.outputs.tag }}" release-assets/*.apk --clobber
+
+  publish:
+    name: Publish release
+    needs: [version, desktop, android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish stable or beta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+          CHANNEL: ${{ needs.version.outputs.channel }}
+        run: |
+          if [ "$CHANNEL" = "testing" ]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --latest=false
+          else
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          fi

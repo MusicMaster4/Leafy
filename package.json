@@ -1,5 +1,5 @@
 {
-  "name": "lumina-financas",
+  "name": "leafy-financas",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -8,12 +8,15 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "version:next": "node scripts/release-version.mjs --dry-run"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
     "date-fns": "^4.1.0",
     "lucide-react": "^0.468.0",
+    "qrcode.react": "^4.2.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "recharts": "^3.10.1"

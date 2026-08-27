@@ -8,6 +8,19 @@ export const money = (value: number, compact = false) =>
     maximumFractionDigits: compact ? 1 : 2,
   }).format(value)
 
+export function parseAmount(input: string) {
+  const clean = input.trim().replace(/[^\d.,-]/g, '')
+  const comma = clean.lastIndexOf(',')
+  const dot = clean.lastIndexOf('.')
+  if (comma >= 0 && dot >= 0) {
+    const decimal = comma > dot ? ',' : '.'
+    const thousands = decimal === ',' ? /\./g : /,/g
+    return Number(clean.replace(thousands, '').replace(decimal, '.'))
+  }
+  if (comma >= 0) return Number(clean.replace(/\./g, '').replace(',', '.'))
+  return Number(clean)
+}
+
 export function summarize(transactions: Transaction[]) {
   const income = transactions.filter(t => t.type === 'income').reduce((sum, t) => sum + t.amount, 0)
   const expenses = transactions.filter(t => t.type === 'expense').reduce((sum, t) => sum + t.amount, 0)
@@ -27,8 +40,8 @@ export function dailySeries(transactions: Transaction[], days = 30) {
     const daily = transactions.filter(t => t.date === key)
     return {
       date: format(day, 'dd/MM'),
-      receitas: daily.filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0),
-      gastos: daily.filter(t => t.type === 'expense').reduce((s, t) => s + t.amount, 0),
+      income: daily.filter(t => t.type === 'income').reduce((s, t) => s + t.amount, 0),
+      expenses: daily.filter(t => t.type === 'expense').reduce((s, t) => s + t.amount, 0),
     }
   })
 }
