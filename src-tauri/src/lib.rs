@@ -644,9 +644,16 @@ fn private_sync_url(endpoint: &str) -> Result<reqwest::Url, String> {
     {
         return Err("The sync endpoint is not allowed".into());
     }
-    let address: IpAddr = url
+    let host = url
         .host_str()
-        .ok_or("The sync endpoint has no address")?
+        .ok_or("The sync endpoint has no address")?;
+    // URL serialization wraps IPv6 hosts in brackets. Remove only that
+    // syntactic pair before parsing the literal address.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let address: IpAddr = host
         .parse()
         .map_err(|_| "The sync endpoint must use a private IP address")?;
     let private = match address {
@@ -894,8 +901,14 @@ mod security_tests {
     fn accepts_only_private_pinned_sync_destinations() {
         assert!(private_sync_url("https://192.168.1.20:49152/sync").is_ok());
         assert!(private_sync_url("https://10.0.0.2:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.64.0.1:49152/sync").is_ok());
         assert!(private_sync_url("https://100.113.41.57:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.127.255.254:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.63.255.254:49152/sync").is_err());
         assert!(private_sync_url("https://100.128.0.1:49152/sync").is_err());
+        assert!(private_sync_url("https://[fd7a:115c:a1e0::1234]:49152/sync").is_ok());
+        assert!(private_sync_url("https://[fd00::1234]:49152/sync").is_ok());
+        assert!(private_sync_url("https://[2001:4860:4860::8888]:49152/sync").is_err());
         assert!(private_sync_url("http://192.168.1.20:49152/sync").is_err());
         assert!(private_sync_url("https://example.com/sync").is_err());
         assert!(private_sync_url("https://8.8.8.8/sync").is_err());
