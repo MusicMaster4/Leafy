@@ -1,21 +1,28 @@
 package app.leafy.financas
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import android.provider.OpenableColumns
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.FileProvider
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.math.max
@@ -28,12 +35,16 @@ class MainActivity : TauriActivity() {
     private const val MAX_TEXT_CHARS = 150_000
     private const val MAX_IMAGE_EDGE = 2048
     private const val SHARE_CONSUMED = "app.leafy.financas.SHARE_CONSUMED"
+    private const val MAX_UPDATE_BYTES = 200L * 1024L * 1024L
+    private const val MAX_UPDATE_REDIRECTS = 5
   }
 
   private data class PendingEvent(val name: String, val json: String)
 
   private val receiptExecutor = Executors.newSingleThreadExecutor()
+  private val updateExecutor = Executors.newSingleThreadExecutor()
   @Volatile private var pendingEvent: PendingEvent? = null
+  @Volatile private var pendingUpdateFile: File? = null
   private var leafyWebView: WebView? = null
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,6 +54,7 @@ class MainActivity : TauriActivity() {
 
   override fun onWebViewCreate(webView: WebView) {
     leafyWebView = webView
+    webView.addJavascriptInterface(UpdateBridge(), "LeafyAndroid")
     receiveShareIntent(intent)
     dispatchPendingEvent()
   }
@@ -56,7 +68,129 @@ class MainActivity : TauriActivity() {
   override fun onDestroy() {
     leafyWebView = null
     receiptExecutor.shutdownNow()
+    updateExecutor.shutdownNow()
     super.onDestroy()
+  }
+
+  override fun onResume() {
+    super.onResume()
+    val update = pendingUpdateFile ?: return
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+      pendingUpdateFile = null
+      openPackageInstaller(update)
+    }
+  }
+
+  private inner class UpdateBridge {
+    @JavascriptInterface
+    fun installUpdate(downloadUrl: String) {
+      if (!isOfficialUpdateUrl(downloadUrl, false)) {
+        emitUpdateError("Leafy refused an untrusted update address.")
+        return
+      }
+      updateExecutor.execute { downloadAndInstallUpdate(downloadUrl) }
+    }
+  }
+
+  private fun downloadAndInstallUpdate(downloadUrl: String) {
+    val directory = File(cacheDir, "updates").apply { mkdirs() }
+    val destination = File(directory, "leafy-update.apk")
+    val temporary = File(directory, "leafy-update.apk.part")
+    try {
+      var current = downloadUrl
+      var redirects = 0
+      var connection: HttpURLConnection
+      while (true) {
+        val allowRedirectHost = redirects > 0
+        require(isOfficialUpdateUrl(current, allowRedirectHost)) { "Untrusted update redirect" }
+        connection = (URL(current).openConnection() as HttpURLConnection).apply {
+          instanceFollowRedirects = false
+          connectTimeout = 10_000
+          readTimeout = 30_000
+          setRequestProperty("Accept", "application/octet-stream")
+          setRequestProperty("User-Agent", "Leafy Android updater")
+        }
+        val status = connection.responseCode
+        if (status !in 300..399) break
+        val location = connection.getHeaderField("Location") ?: throw IllegalStateException("Missing update redirect")
+        connection.disconnect()
+        redirects += 1
+        require(redirects <= MAX_UPDATE_REDIRECTS) { "Too many update redirects" }
+        current = URL(URL(current), location).toString()
+      }
+      require(connection.responseCode in 200..299) { "Update server returned ${connection.responseCode}" }
+      val expected = connection.contentLengthLong
+      require(expected in 1..MAX_UPDATE_BYTES) { "Invalid update size" }
+      connection.inputStream.use { input ->
+        FileOutputStream(temporary).use { output ->
+          val buffer = ByteArray(64 * 1024)
+          var total = 0L
+          while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            require(total <= MAX_UPDATE_BYTES) { "Update is too large" }
+            output.write(buffer, 0, count)
+            emitUpdateProgress(((total * 100L) / expected).toInt().coerceIn(0, 100))
+          }
+          require(total == expected) { "Incomplete update download" }
+        }
+      }
+      connection.disconnect()
+      if (destination.exists()) destination.delete()
+      require(temporary.renameTo(destination)) { "Could not prepare the update" }
+      runOnUiThread { requestPackageInstall(destination) }
+    } catch (_: Exception) {
+      temporary.delete()
+      emitUpdateError("Leafy could not securely download this update.")
+    }
+  }
+
+  private fun isOfficialUpdateUrl(value: String, allowRedirectHost: Boolean): Boolean = try {
+    val url = URL(value)
+    if (url.protocol != "https" || url.userInfo != null || url.port != -1 || url.ref != null) false
+    else if (!allowRedirectHost) {
+      url.query == null && url.host == "github.com" &&
+        url.path.startsWith("/MusicMaster4/Leafy/releases/download/v") &&
+        (url.path.endsWith("/leafy.apk") || url.path.endsWith("/leafy-beta.apk"))
+    } else {
+      url.host.endsWith(".githubusercontent.com") || url.host == "githubusercontent.com"
+    }
+  } catch (_: Exception) { false }
+
+  private fun requestPackageInstall(file: File) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+      pendingUpdateFile = file
+      emitUpdateStatus("permission")
+      startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+      return
+    }
+    openPackageInstaller(file)
+  }
+
+  private fun openPackageInstaller(file: File) {
+    try {
+      val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+      startActivity(Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+      })
+      emitUpdateStatus("installing")
+    } catch (_: ActivityNotFoundException) {
+      emitUpdateError("Android could not open the package installer.")
+    }
+  }
+
+  private fun emitUpdateProgress(percent: Int) {
+    queueEvent("leafy:update-progress", JSONObject().put("percent", percent))
+  }
+
+  private fun emitUpdateStatus(status: String) {
+    queueEvent("leafy:update-status", JSONObject().put("status", status))
+  }
+
+  private fun emitUpdateError(message: String) {
+    queueEvent("leafy:update-error", JSONObject().put("message", message))
   }
 
   private fun receiveShareIntent(sharedIntent: Intent?) {

@@ -27,8 +27,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 subtle = "2"
 tauri-plugin-opener = "2"
 
-# The installable GitHub APK uses the hardened Android debug variant for
-# automatic signing. Keep its native core optimized and free of debug symbols.
+# Keep local Android debug builds reasonably small and free of debug symbols.
+# Published APKs use the persistent release key configured in GitHub Actions.
 [profile.dev]
 opt-level = 2
 debug = 0

@@ -14,6 +14,11 @@ val tauriProperties = Properties().apply {
     }
 }
 
+val leafyReleaseKeystore = System.getenv("LEAFY_ANDROID_KEYSTORE_PATH")
+val leafyReleaseStorePassword = System.getenv("LEAFY_ANDROID_KEYSTORE_PASSWORD")
+val leafyReleaseKeyAlias = System.getenv("LEAFY_ANDROID_KEY_ALIAS")
+val leafyReleaseKeyPassword = System.getenv("LEAFY_ANDROID_KEY_PASSWORD")
+
 android {
     compileSdk = 36
     namespace = "app.leafy.financas"
@@ -25,6 +30,20 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
+    signingConfigs {
+        if (!leafyReleaseKeystore.isNullOrBlank() &&
+            !leafyReleaseStorePassword.isNullOrBlank() &&
+            !leafyReleaseKeyAlias.isNullOrBlank() &&
+            !leafyReleaseKeyPassword.isNullOrBlank()
+        ) {
+            create("leafyRelease") {
+                storeFile = file(leafyReleaseKeystore)
+                storePassword = leafyReleaseStorePassword
+                keyAlias = leafyReleaseKeyAlias
+                keyPassword = leafyReleaseKeyPassword
+            }
+        }
+    }
     buildTypes {
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "false"
@@ -34,6 +53,7 @@ android {
             isMinifyEnabled = false
         }
         getByName("release") {
+            signingConfig = signingConfigs.findByName("leafyRelease")
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }

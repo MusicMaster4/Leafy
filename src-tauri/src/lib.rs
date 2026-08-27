@@ -9,6 +9,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::{
     net::{IpAddr, TcpListener},
     sync::{Arc, Mutex},
@@ -79,6 +80,14 @@ struct ChatAnswer {
 struct GithubRelease {
     tag_name: String,
     html_url: String,
+    prerelease: bool,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
 }
 
 #[derive(Serialize)]
@@ -88,22 +97,68 @@ struct UpdateCheck {
     latest_version: String,
     available: bool,
     release_url: String,
+    apk_url: Option<String>,
 }
 
-fn version_parts(version: &str) -> Option<[u64; 3]> {
-    let core = version.trim().trim_start_matches('v').split('-').next()?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReleaseVersion {
+    core: [u64; 3],
+    testing: Option<u64>,
+}
+
+impl Ord for ReleaseVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.core.cmp(&other.core).then_with(|| match (self.testing, other.testing) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(_), None) => Ordering::Less,
+            (Some(left), Some(right)) => left.cmp(&right),
+        })
+    }
+}
+
+impl PartialOrd for ReleaseVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn parse_release_version(version: &str) -> Option<ReleaseVersion> {
+    let version = version.trim().trim_start_matches('v');
+    let (core, suffix) = version.split_once('-').map_or((version, None), |(core, suffix)| (core, Some(suffix)));
     let mut parts = core.split('.').map(str::parse::<u64>);
-    let parsed = [
+    let core = [
         parts.next()?.ok()?,
         parts.next()?.ok()?,
         parts.next()?.ok()?,
     ];
-    parts.next().is_none().then_some(parsed)
+    if parts.next().is_some() {
+        return None;
+    }
+    let testing = match suffix {
+        None => None,
+        Some(value) => Some(value.strip_prefix("testing.")?.parse().ok()?),
+    };
+    Some(ReleaseVersion { core, testing })
+}
+
+fn trusted_apk_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.path().starts_with("/MusicMaster4/Leafy/releases/download/v")
+            && matches!(url.path().rsplit('/').next(), Some("leafy.apk" | "leafy-beta.apk"))
+    })
 }
 
 #[tauri::command]
 async fn check_for_updates() -> Result<UpdateCheck, String> {
-    const MAX_RELEASE_BYTES: usize = 64 * 1024;
+    const MAX_RELEASE_BYTES: usize = 512 * 1024;
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let response = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
@@ -111,7 +166,7 @@ async fn check_for_updates() -> Result<UpdateCheck, String> {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "Could not prepare the update check")?
-        .get("https://api.github.com/repos/MusicMaster4/Leafy/releases/latest")
+        .get("https://api.github.com/repos/MusicMaster4/Leafy/releases?per_page=20")
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "Leafy update checker")
         .send()
@@ -133,15 +188,27 @@ async fn check_for_updates() -> Result<UpdateCheck, String> {
     if bytes.len() > MAX_RELEASE_BYTES {
         return Err("GitHub Releases returned an oversized response".into());
     }
-    let release: GithubRelease = serde_json::from_slice(&bytes)
+    let releases: Vec<GithubRelease> = serde_json::from_slice(&bytes)
         .map_err(|_| "GitHub Releases returned an invalid response")?;
-    let current = version_parts(&current_version).ok_or("The current app version is invalid")?;
-    let latest = version_parts(&release.tag_name).ok_or("The latest release version is invalid")?;
+    let current = parse_release_version(&current_version).ok_or("The current app version is invalid")?;
+    let testing_channel = current.testing.is_some();
+    let (release, latest) = releases
+        .iter()
+        .filter(|release| testing_channel || !release.prerelease)
+        .filter_map(|release| parse_release_version(&release.tag_name).map(|version| (release, version)))
+        .max_by_key(|(_, version)| *version)
+        .ok_or("GitHub Releases did not return a compatible release")?;
+    let apk_url = release
+        .assets
+        .iter()
+        .find(|asset| matches!(asset.name.as_str(), "leafy.apk" | "leafy-beta.apk") && trusted_apk_url(&asset.browser_download_url))
+        .map(|asset| asset.browser_download_url.clone());
     Ok(UpdateCheck {
         current_version,
         latest_version: release.tag_name.trim_start_matches('v').to_string(),
         available: latest > current,
-        release_url: release.html_url,
+        release_url: release.html_url.clone(),
+        apk_url,
     })
 }
 
@@ -544,10 +611,12 @@ mod security_tests {
 
     #[test]
     fn parses_release_versions_for_update_comparison() {
-        assert_eq!(version_parts("v1.12.3"), Some([1, 12, 3]));
-        assert_eq!(version_parts("0.2.0-beta.4"), Some([0, 2, 0]));
-        assert_eq!(version_parts("1.2"), None);
-        assert!(version_parts("1.10.0").unwrap() > version_parts("1.9.9").unwrap());
+        assert_eq!(parse_release_version("v1.12.3").unwrap().core, [1, 12, 3]);
+        assert!(parse_release_version("0.2.0-testing.4").unwrap() > parse_release_version("0.2.0-testing.3").unwrap());
+        assert!(parse_release_version("0.2.0").unwrap() > parse_release_version("0.2.0-testing.4").unwrap());
+        assert!(parse_release_version("1.2").is_none());
+        assert!(parse_release_version("1.10.0").unwrap() > parse_release_version("1.9.9").unwrap());
+        assert!(parse_release_version("0.2.0-beta.4").is_none());
     }
 
     #[test]
@@ -563,6 +632,14 @@ mod security_tests {
         assert!(trusted_release_url(&valid));
         assert!(!trusted_release_url(&lookalike));
         assert!(!trusted_release_url(&wrong_repo));
+    }
+
+    #[test]
+    fn accepts_only_official_leafy_apk_assets() {
+        assert!(trusted_apk_url("https://github.com/MusicMaster4/Leafy/releases/download/v0.1.6-testing.3/leafy-beta.apk"));
+        assert!(trusted_apk_url("https://github.com/MusicMaster4/Leafy/releases/download/v0.1.5/leafy.apk"));
+        assert!(!trusted_apk_url("https://github.com/other/Leafy/releases/download/v9/leafy.apk"));
+        assert!(!trusted_apk_url("https://github.com/MusicMaster4/Leafy/releases/download/v9/other.apk"));
     }
 
     #[test]

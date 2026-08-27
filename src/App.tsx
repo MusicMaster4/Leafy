@@ -26,7 +26,7 @@ import {
   createPairing, forgetPeer, mergeTransactions, parsePairing, pullFromPeer, pushToPeer,
   rememberPeer, savedPeer, scanPairingCode, serializePairing, type PairingDetails,
 } from './sync'
-import { checkForUpdates, openRelease, type UpdateCheck } from './updates'
+import { canInstallAndroidUpdate, checkForUpdates, installAndroidUpdate, openRelease, type UpdateCheck } from './updates'
 
 const COLORS: Record<string, string> = {
   Food: '#d9a441', Housing: '#718bdb', Transport: '#51a98e', Leisure: '#d86f91',
@@ -123,9 +123,11 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
   )
 }
 
-function PreferencesPanel({ currency, onCurrencyChange, onClose, onNotice }: {
+function PreferencesPanel({ currency, checkingUpdates, onCurrencyChange, onCheckUpdates, onClose, onNotice }: {
   currency: CurrencyCode
+  checkingUpdates: boolean
   onCurrencyChange: (currency: CurrencyCode) => Promise<void>
+  onCheckUpdates: () => Promise<void>
   onClose: () => void
   onNotice: (message: string) => void
 }) {
@@ -150,6 +152,7 @@ function PreferencesPanel({ currency, onCurrencyChange, onClose, onNotice }: {
       <label className="input-label"><span>Display currency</span><select value={selectedCurrency} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
       <div className="privacy-callout"><KeyRound size={20}/><div><b>Your key stays on this device</b><span>Leafy sends only the transaction description to OpenRouter when Auto is selected. The key is held in app memory and is never committed or synced.</span></div></div>
       <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder="sk-or-v1-..." value={key} onChange={event => setKey(event.target.value)} /></label>
+      <div className="preferences-update"><div><b>App updates</b><span>Check GitHub Releases for the newest version of your installed channel.</span></div><button type="button" onClick={() => void onCheckUpdates()} disabled={checkingUpdates}><RefreshCw size={15} className={checkingUpdates ? 'spinning' : ''}/>{checkingUpdates ? 'Checking...' : 'Check for updates'}</button></div>
       <button className="save-button income" disabled={saving}>{saving ? 'Saving...' : 'Save preferences'}</button>
       <p className="privacy-note">You can also set OPENROUTER_API_KEY before launching Leafy.</p>
     </form>
@@ -287,6 +290,8 @@ export default function App() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false)
   const [checkingUpdates, setCheckingUpdates] = useState(false)
   const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null)
+  const [installingUpdate, setInstallingUpdate] = useState(false)
+  const [updateProgress, setUpdateProgress] = useState(0)
   const [activeSection, setActiveSection] = useState<DashboardSection>('overview')
   const profileMenuRef = useRef<HTMLDivElement>(null)
   const overviewRef = useRef<HTMLElement>(null)
@@ -343,6 +348,31 @@ export default function App() {
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
+  }, [])
+
+  useEffect(() => {
+    const progress = (event: Event) => {
+      const percent = (event as CustomEvent<{ percent?: unknown }>).detail?.percent
+      if (typeof percent === 'number') setUpdateProgress(percent)
+    }
+    const status = (event: Event) => {
+      const value = (event as CustomEvent<{ status?: unknown }>).detail?.status
+      if (value === 'permission') setToast('Allow Leafy to install apps, then return to continue.')
+      if (value === 'installing') setToast('Update downloaded. Confirm the installation in Android.')
+    }
+    const error = (event: Event) => {
+      const message = (event as CustomEvent<{ message?: unknown }>).detail?.message
+      setInstallingUpdate(false)
+      setToast(typeof message === 'string' ? message : 'Could not install the update.')
+    }
+    window.addEventListener('leafy:update-progress', progress)
+    window.addEventListener('leafy:update-status', status)
+    window.addEventListener('leafy:update-error', error)
+    return () => {
+      window.removeEventListener('leafy:update-progress', progress)
+      window.removeEventListener('leafy:update-status', status)
+      window.removeEventListener('leafy:update-error', error)
+    }
   }, [])
 
   useEffect(() => {
@@ -424,7 +454,20 @@ export default function App() {
     } finally {
       setCheckingUpdates(false)
       setProfileMenuOpen(false)
+      setPreferencesOpen(false)
       window.setTimeout(() => setToast(''), 4200)
+    }
+  }
+
+  const installAvailableUpdate = () => {
+    if (!availableUpdate?.apkUrl) return
+    try {
+      setInstallingUpdate(true)
+      setUpdateProgress(0)
+      installAndroidUpdate(availableUpdate.apkUrl)
+    } catch {
+      setInstallingUpdate(false)
+      setToast('The Android installer is unavailable.')
     }
   }
 
@@ -513,7 +556,7 @@ export default function App() {
       </main>
 
       {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} />}
-      {preferencesOpen && <PreferencesPanel currency={currency} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
+      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} onCheckUpdates={checkUpdates} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
       {syncOpen && <SyncPanel transactions={transactions} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onMerge={rows => setTransactions(current => mergeTransactions(current, rows))} />}
       {sharedReceipt && (
         <ReceiptReview source={sharedReceipt} onClose={() => setSharedReceipt(null)} onAdd={(row, useAi) => {
@@ -525,7 +568,9 @@ export default function App() {
       {availableUpdate && <div className="update-notice" role="status">
         <span className="update-notice-icon"><RefreshCw size={17}/></span>
         <div><b>Update available</b><span>Leafy {availableUpdate.latestVersion} is ready to download.</span></div>
-        <button type="button" className="view-release-button" onClick={() => void openRelease(availableUpdate.releaseUrl).catch(() => setToast('Could not open GitHub Releases.'))}>View release</button>
+        {canInstallAndroidUpdate() && availableUpdate.apkUrl
+          ? <button type="button" className="view-release-button" onClick={installAvailableUpdate} disabled={installingUpdate}>{installingUpdate ? `Downloading ${updateProgress}%` : 'Download and install'}</button>
+          : <button type="button" className="view-release-button" onClick={() => void openRelease(availableUpdate.releaseUrl).catch(() => setToast('Could not open GitHub Releases.'))}>View release</button>}
         <button type="button" className="dismiss-update" aria-label="Dismiss update notice" onClick={() => setAvailableUpdate(null)}><X size={16}/></button>
       </div>}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}

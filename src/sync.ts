@@ -78,15 +78,36 @@ export async function createPairing(transactions: Transaction[]): Promise<Pairin
 }
 
 export function serializePairing(details: PairingDetails) {
-  return `leafy://pair?data=${encode(new TextEncoder().encode(JSON.stringify(details)))}`
+  const query = new URLSearchParams({
+    v: String(details.version),
+    e: details.endpoint,
+    t: details.token,
+    k: details.key,
+    c: details.certificate,
+    s: details.sessionId,
+    x: details.expiresAt,
+    d: details.deviceName,
+  })
+  return `leafy://pair?${query}`
 }
 
 export function parsePairing(value: string): PairingDetails {
   const url = new URL(value)
   if (url.protocol !== 'leafy:' || url.hostname !== 'pair') throw new Error('This is not a Leafy pairing code')
   const data = url.searchParams.get('data')
-  if (!data) throw new Error('Pairing details are missing')
-  const details = JSON.parse(new TextDecoder().decode(decode(data))) as PairingDetails
+  // Keep accepting version 2 codes created by earlier desktop builds.
+  const details = data
+    ? JSON.parse(new TextDecoder().decode(decode(data))) as PairingDetails
+    : {
+        version: Number(url.searchParams.get('v')),
+        endpoint: url.searchParams.get('e') ?? '',
+        token: url.searchParams.get('t') ?? '',
+        key: url.searchParams.get('k') ?? '',
+        certificate: url.searchParams.get('c') ?? '',
+        sessionId: url.searchParams.get('s') ?? '',
+        expiresAt: url.searchParams.get('x') ?? '',
+        deviceName: url.searchParams.get('d') ?? 'Leafy Desktop',
+      } as PairingDetails
   if (details.version !== 2 || !details.endpoint || !details.token || !details.key || !details.certificate || !details.sessionId) throw new Error('Unsupported pairing code')
   if (decode(details.token).length !== 32 || decode(details.key).length !== 32 || decode(details.sessionId).length !== 16) throw new Error('Invalid pairing secrets')
   if (!details.expiresAt || Date.parse(details.expiresAt) <= Date.now()) throw new Error('This pairing code has expired')
@@ -97,7 +118,8 @@ export async function scanPairingCode() {
   let permission = await checkPermissions()
   if (permission !== 'granted') permission = await requestPermissions()
   if (permission !== 'granted') throw new Error('Camera access is required to scan the QR code')
-  const result = await scan({ cameraDirection: 'back', formats: [Format.QRCode] })
+  const result = await scan({ cameraDirection: 'back', formats: [Format.QRCode], windowed: false })
+  if (!result.content) throw new Error('The camera did not return a QR code')
   return parsePairing(result.content)
 }
 

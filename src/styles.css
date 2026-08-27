@@ -161,6 +161,12 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
 .privacy-callout div { display: grid; gap: 4px; }
 .privacy-callout b { color: #dce7c7; font-size: 10px; }
 .privacy-callout span { color: #818a7d; font-size: 9px; line-height: 1.5; }
+.preferences-update { margin-bottom: 16px; padding: 12px; display: flex; align-items: center; justify-content: space-between; gap: 14px; border: 1px solid var(--line-strong); border-radius: 5px; background: #151816; }
+.preferences-update > div { display: grid; gap: 3px; }
+.preferences-update b { color: var(--ink); font-size: 10px; }
+.preferences-update span { color: #747b75; font-size: 9px; line-height: 1.4; }
+.preferences-update button { min-height: 36px; padding: 8px 10px; display: inline-flex; align-items: center; gap: 7px; flex: none; border: 1px solid #3c4436; border-radius: 4px; background: #20251e; color: #c8d5b5; font-size: 9px; font-weight: 700; cursor: pointer; }
+.preferences-update button:disabled { opacity: .55; cursor: wait; }
 .save-button { width: 100%; min-height: 43px; margin-top: 4px; padding: 11px; border: 0; border-radius: 5px; background: var(--orange); color: #21110d; font-size: 11px; font-weight: 750; cursor: pointer; }
 .save-button.income { background: var(--green); color: #151b0d; }
 .save-button:hover { filter: brightness(1.06); }
@@ -214,6 +220,7 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
 .update-notice b { font-size: 11px; font-weight: 650; }
 .update-notice div span { overflow: hidden; color: #838a83; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .view-release-button { padding: 8px 10px; border: 0; border-radius: 4px; background: var(--green); color: #151a10; font-size: 9px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.view-release-button:disabled { opacity: .7; cursor: wait; }
 .dismiss-update { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 4px; background: transparent; color: #747b74; cursor: pointer; }
 .dismiss-update:hover { color: #e0e4de; background: #232824; }
 .mobile-add-button { display: none; }
@@ -279,6 +286,8 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
   .type-switch button, .sync-tabs button, .category-chips button, .save-button, .scan-button, .manual-code button { min-height: 44px; }
   .quick-entry input, .quick-entry select, .search { min-height: 44px; }
   .input-label input, .input-label select, .manual-code input, .search input { font-size: 16px; }
+  .preferences-update { align-items: stretch; flex-direction: column; }
+  .preferences-update button { min-height: 44px; justify-content: center; }
   .toast { bottom: calc(76px + env(safe-area-inset-bottom)); max-width: calc(100vw - 32px); white-space: nowrap; }
   .update-notice { right: 16px; bottom: calc(76px + env(safe-area-inset-bottom)); grid-template-columns: 34px minmax(0, 1fr) auto; }
   .view-release-button { grid-column: 2; justify-self: start; }

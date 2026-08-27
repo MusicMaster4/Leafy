@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { decryptSnapshot, encryptSnapshot } from './sync'
+import { decryptSnapshot, encryptSnapshot, parsePairing, serializePairing, type PairingDetails } from './sync'
 import type { Transaction } from './types'
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
@@ -36,5 +36,29 @@ describe('private sync envelope', () => {
     const invalid = [{ ...rows[0], amount: Number.POSITIVE_INFINITY }]
     const sealed = await encryptSnapshot(invalid, key, session)
     await expect(decryptSnapshot(sealed, key, session)).rejects.toThrow('Unsupported sync payload')
+  })
+})
+
+describe('pairing QR payload', () => {
+  const pairing: PairingDetails = {
+    version: 2,
+    endpoint: 'https://192.168.100.123:49152/sync',
+    token: encode(new Uint8Array(32).fill(1)),
+    key: encode(new Uint8Array(32).fill(2)),
+    certificate: encode(new Uint8Array(375).fill(3)),
+    sessionId: encode(new Uint8Array(16).fill(4)),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    deviceName: 'Leafy Desktop',
+  }
+
+  it('uses a compact QR payload and round-trips every security field', () => {
+    const code = serializePairing(pairing)
+    expect(code.length).toBeLessThan(800)
+    expect(parsePairing(code)).toEqual(pairing)
+  })
+
+  it('still accepts QR codes from earlier version 2 desktop builds', () => {
+    const legacy = `leafy://pair?data=${encode(new TextEncoder().encode(JSON.stringify(pairing)))}`
+    expect(parsePairing(legacy)).toEqual(pairing)
   })
 })
