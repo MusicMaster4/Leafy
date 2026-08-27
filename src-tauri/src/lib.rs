@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     extract::{DefaultBodyLimit, State as AxumState},
     http::{header::AUTHORIZATION, HeaderMap, Response, StatusCode},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
@@ -29,7 +29,7 @@ fn ensure_crypto_provider() {
 
 #[derive(Default)]
 struct AppState {
-    openrouter_key: Mutex<Option<String>>,
+    openrouter_key: Arc<Mutex<Option<String>>>,
     received_sync: Arc<Mutex<Option<String>>>,
 }
 
@@ -39,12 +39,22 @@ struct SyncServerState {
     expires_at: Instant,
     payload: Arc<RwLock<String>>,
     received: Arc<Mutex<Option<String>>>,
+    openrouter_key: Arc<Mutex<Option<String>>>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PairingSession {
     endpoint: String,
     certificate: String,
+    network_mode: &'static str,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizeRequest {
+    description: String,
+    transaction_type: String,
 }
 
 #[derive(Serialize)]
@@ -108,12 +118,14 @@ struct ReleaseVersion {
 
 impl Ord for ReleaseVersion {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.core.cmp(&other.core).then_with(|| match (self.testing, other.testing) {
-            (None, None) => Ordering::Equal,
-            (None, Some(_)) => Ordering::Greater,
-            (Some(_), None) => Ordering::Less,
-            (Some(left), Some(right)) => left.cmp(&right),
-        })
+        self.core
+            .cmp(&other.core)
+            .then_with(|| match (self.testing, other.testing) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(&right),
+            })
     }
 }
 
@@ -125,7 +137,9 @@ impl PartialOrd for ReleaseVersion {
 
 fn parse_release_version(version: &str) -> Option<ReleaseVersion> {
     let version = version.trim().trim_start_matches('v');
-    let (core, suffix) = version.split_once('-').map_or((version, None), |(core, suffix)| (core, Some(suffix)));
+    let (core, suffix) = version
+        .split_once('-')
+        .map_or((version, None), |(core, suffix)| (core, Some(suffix)));
     let mut parts = core.split('.').map(str::parse::<u64>);
     let core = [
         parts.next()?.ok()?,
@@ -151,8 +165,13 @@ fn trusted_apk_url(url: &str) -> bool {
             && url.port().is_none()
             && url.query().is_none()
             && url.fragment().is_none()
-            && url.path().starts_with("/MusicMaster4/Leafy/releases/download/v")
-            && matches!(url.path().rsplit('/').next(), Some("leafy.apk" | "leafy-beta.apk"))
+            && url
+                .path()
+                .starts_with("/MusicMaster4/Leafy/releases/download/v")
+            && matches!(
+                url.path().rsplit('/').next(),
+                Some("leafy.apk" | "leafy-beta.apk")
+            )
     })
 }
 
@@ -190,18 +209,24 @@ async fn check_for_updates() -> Result<UpdateCheck, String> {
     }
     let releases: Vec<GithubRelease> = serde_json::from_slice(&bytes)
         .map_err(|_| "GitHub Releases returned an invalid response")?;
-    let current = parse_release_version(&current_version).ok_or("The current app version is invalid")?;
+    let current =
+        parse_release_version(&current_version).ok_or("The current app version is invalid")?;
     let testing_channel = current.testing.is_some();
     let (release, latest) = releases
         .iter()
         .filter(|release| testing_channel || !release.prerelease)
-        .filter_map(|release| parse_release_version(&release.tag_name).map(|version| (release, version)))
+        .filter_map(|release| {
+            parse_release_version(&release.tag_name).map(|version| (release, version))
+        })
         .max_by_key(|(_, version)| *version)
         .ok_or("GitHub Releases did not return a compatible release")?;
     let apk_url = release
         .assets
         .iter()
-        .find(|asset| matches!(asset.name.as_str(), "leafy.apk" | "leafy-beta.apk") && trusted_apk_url(&asset.browser_download_url))
+        .find(|asset| {
+            matches!(asset.name.as_str(), "leafy.apk" | "leafy-beta.apk")
+                && trusted_apk_url(&asset.browser_download_url)
+        })
         .map(|asset| asset.browser_download_url.clone());
     Ok(UpdateCheck {
         current_version,
@@ -254,6 +279,20 @@ async fn categorize_transaction(
     transaction_type: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let key = state
+        .openrouter_key
+        .lock()
+        .map_err(|_| "Could not access the key store")?
+        .clone()
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
+    categorize_with_openrouter(description, transaction_type, key).await
+}
+
+async fn categorize_with_openrouter(
+    description: String,
+    transaction_type: String,
+    key: Option<String>,
+) -> Result<String, String> {
     let description = description.trim();
     if description.is_empty() || description.len() > 200 {
         return Err("Transaction descriptions must be between 1 and 200 characters".into());
@@ -261,13 +300,7 @@ async fn categorize_transaction(
     if transaction_type != "income" && transaction_type != "expense" {
         return Err("Invalid transaction type".into());
     }
-    let key = state
-        .openrouter_key
-        .lock()
-        .map_err(|_| "Could not access the key store")?
-        .clone()
-        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-        .ok_or("OpenRouter is not configured")?;
+    let key = key.ok_or("OpenRouter is not configured")?;
 
     let categories = if transaction_type == "income" {
         "Salary, Freelance, Investments, Gift, Other"
@@ -417,6 +450,61 @@ async fn upload_sync(
         .unwrap()
 }
 
+async fn categorize_for_peer(
+    AxumState(state): AxumState<SyncServerState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<CategorizeRequest>,
+) -> Response<Body> {
+    if !is_authorized(&headers, &state) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::empty())
+            .unwrap();
+    }
+    let key = state
+        .openrouter_key
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
+    match categorize_with_openrouter(request.description, request.transaction_type, key).await {
+        Ok(category) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from(category))
+            .unwrap(),
+        Err(error) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(error))
+            .unwrap(),
+    }
+}
+
+fn is_tailscale_ipv4(value: std::net::Ipv4Addr) -> bool {
+    let octets = value.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn sync_address() -> Result<(IpAddr, bool), String> {
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        if let Some((_, address)) = interfaces.into_iter().find(|(name, address)| {
+            name.to_ascii_lowercase().contains("tailscale")
+                && match address {
+                    IpAddr::V4(value) => is_tailscale_ipv4(*value),
+                    IpAddr::V6(value) => value.is_unique_local(),
+                }
+        }) {
+            return Ok((address, true));
+        }
+    }
+    local_ip_address::local_ip()
+        .map(|address| {
+            let tailscale = matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(value));
+            (address, tailscale)
+        })
+        .map_err(|error| format!("Could not find a local or Tailscale address: {error}"))
+}
+
 #[tauri::command]
 async fn start_pairing_server(
     token: String,
@@ -436,8 +524,7 @@ async fn start_pairing_server(
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let address = local_ip_address::local_ip()
-        .map_err(|error| format!("Could not find a local network address: {error}"))?;
+    let (address, tailscale) = sync_address()?;
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec![address.to_string()])
         .map_err(|error| format!("Could not create the private TLS session: {error}"))?;
     let certificate = cert.der().to_vec();
@@ -449,9 +536,11 @@ async fn start_pairing_server(
         expires_at: Instant::now() + Duration::from_secs(SYNC_SESSION_SECONDS),
         payload: Arc::new(RwLock::new(payload)),
         received: state.received_sync.clone(),
+        openrouter_key: state.openrouter_key.clone(),
     };
     let app = Router::new()
         .route("/sync", get(download_sync).put(upload_sync))
+        .route("/categorize", post(categorize_for_peer))
         .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
         .with_state(server_state);
     let server = axum_server::from_tcp_rustls(listener, tls)
@@ -465,6 +554,7 @@ async fn start_pairing_server(
     Ok(PairingSession {
         endpoint: format!("https://{}/sync", std::net::SocketAddr::new(address, port)),
         certificate: URL_SAFE_NO_PAD.encode(certificate),
+        network_mode: if tailscale { "tailscale" } else { "local" },
     })
 }
 
@@ -485,7 +575,12 @@ fn private_sync_url(endpoint: &str) -> Result<reqwest::Url, String> {
         .parse()
         .map_err(|_| "The sync endpoint must use a private IP address")?;
     let private = match address {
-        IpAddr::V4(value) => value.is_private() || value.is_link_local() || value.is_loopback(),
+        IpAddr::V4(value) => {
+            value.is_private()
+                || value.is_link_local()
+                || value.is_loopback()
+                || is_tailscale_ipv4(value)
+        }
         IpAddr::V6(value) => {
             value.is_unique_local() || value.is_unicast_link_local() || value.is_loopback()
         }
@@ -493,6 +588,12 @@ fn private_sync_url(endpoint: &str) -> Result<reqwest::Url, String> {
     private
         .then_some(url)
         .ok_or_else(|| "Leafy only syncs over a private local network".into())
+}
+
+fn private_peer_url(endpoint: &str, path: &str) -> Result<reqwest::Url, String> {
+    let mut url = private_sync_url(endpoint)?;
+    url.set_path(path);
+    Ok(url)
 }
 
 fn private_sync_client(certificate: &str) -> Result<reqwest::Client, String> {
@@ -575,6 +676,43 @@ async fn sync_upload(
 }
 
 #[tauri::command]
+async fn categorize_via_peer(
+    endpoint: String,
+    certificate: String,
+    token: String,
+    description: String,
+    transaction_type: String,
+) -> Result<String, String> {
+    let url = private_peer_url(&endpoint, "/categorize")?;
+    decode_token(&token)?;
+    let response = private_sync_client(&certificate)?
+        .post(url)
+        .bearer_auth(token)
+        .json(&CategorizeRequest {
+            description,
+            transaction_type,
+        })
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach OpenRouter through your computer: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Your computer could not categorize this transaction ({})",
+            response.status()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "Could not read the category from your computer")?;
+    if bytes.len() > 64 {
+        return Err("Your computer returned an invalid category".into());
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| "Your computer returned an invalid category".into())
+}
+
+#[tauri::command]
 fn take_sync_update(state: State<'_, AppState>) -> Result<Option<String>, String> {
     Ok(state
         .received_sync
@@ -597,6 +735,7 @@ pub fn run() {
             start_pairing_server,
             sync_download,
             sync_upload,
+            categorize_via_peer,
             take_sync_update,
             check_for_updates,
             open_release
@@ -612,8 +751,14 @@ mod security_tests {
     #[test]
     fn parses_release_versions_for_update_comparison() {
         assert_eq!(parse_release_version("v1.12.3").unwrap().core, [1, 12, 3]);
-        assert!(parse_release_version("0.2.0-testing.4").unwrap() > parse_release_version("0.2.0-testing.3").unwrap());
-        assert!(parse_release_version("0.2.0").unwrap() > parse_release_version("0.2.0-testing.4").unwrap());
+        assert!(
+            parse_release_version("0.2.0-testing.4").unwrap()
+                > parse_release_version("0.2.0-testing.3").unwrap()
+        );
+        assert!(
+            parse_release_version("0.2.0").unwrap()
+                > parse_release_version("0.2.0-testing.4").unwrap()
+        );
         assert!(parse_release_version("1.2").is_none());
         assert!(parse_release_version("1.10.0").unwrap() > parse_release_version("1.9.9").unwrap());
         assert!(parse_release_version("0.2.0-beta.4").is_none());
@@ -637,9 +782,15 @@ mod security_tests {
     #[test]
     fn accepts_only_official_leafy_apk_assets() {
         assert!(trusted_apk_url("https://github.com/MusicMaster4/Leafy/releases/download/v0.1.6-testing.3/leafy-beta.apk"));
-        assert!(trusted_apk_url("https://github.com/MusicMaster4/Leafy/releases/download/v0.1.5/leafy.apk"));
-        assert!(!trusted_apk_url("https://github.com/other/Leafy/releases/download/v9/leafy.apk"));
-        assert!(!trusted_apk_url("https://github.com/MusicMaster4/Leafy/releases/download/v9/other.apk"));
+        assert!(trusted_apk_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v0.1.5/leafy.apk"
+        ));
+        assert!(!trusted_apk_url(
+            "https://github.com/other/Leafy/releases/download/v9/leafy.apk"
+        ));
+        assert!(!trusted_apk_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v9/other.apk"
+        ));
     }
 
     #[test]
@@ -656,6 +807,8 @@ mod security_tests {
     fn accepts_only_private_pinned_sync_destinations() {
         assert!(private_sync_url("https://192.168.1.20:49152/sync").is_ok());
         assert!(private_sync_url("https://10.0.0.2:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.113.41.57:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.128.0.1:49152/sync").is_err());
         assert!(private_sync_url("http://192.168.1.20:49152/sync").is_err());
         assert!(private_sync_url("https://example.com/sync").is_err());
         assert!(private_sync_url("https://8.8.8.8/sync").is_err());
@@ -691,6 +844,7 @@ mod security_tests {
                 "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA".into(),
             )),
             received: Arc::new(Mutex::new(None)),
+            openrouter_key: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
             .route("/sync", get(download_sync).put(upload_sync))

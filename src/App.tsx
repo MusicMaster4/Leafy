@@ -18,7 +18,7 @@ import {
   currencies, currencyDetails, expenseCategories, incomeCategories, isCurrencyCode,
   type CurrencyCode, type Transaction, type TransactionType,
 } from './types'
-import { categorizeWithAi, configureOpenRouter, localCategory } from './ai'
+import { categorizeWithAi, configureOpenRouter, localCategory, restoreOpenRouter } from './ai'
 import leafyIcon from '../src-tauri/icons/app-icon.svg'
 import { secureGet, secureSet } from './storage'
 import { analyzeReceipt, isSharedReceipt, type SharedReceipt } from './receipt'
@@ -36,6 +36,14 @@ const COLORS: Record<string, string> = {
 const CurrencyContext = createContext<CurrencyCode>('BRL')
 const useCurrency = () => useContext(CurrencyContext)
 type DashboardSection = 'overview' | 'transactions' | 'insights'
+type DashboardPreferences = { days: number; showBalance: boolean }
+
+function errorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'string' && error.trim()) return error
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message
+  return fallback
+}
 
 function useTransactions() {
   const [transactions, setTransactions] = useState<Transaction[]>([])
@@ -123,10 +131,12 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
   )
 }
 
-function PreferencesPanel({ currency, checkingUpdates, onCurrencyChange, onCheckUpdates, onClose, onNotice }: {
+function PreferencesPanel({ currency, checkingUpdates, openRouterConfigured, onCurrencyChange, onKeyConfigured, onCheckUpdates, onClose, onNotice }: {
   currency: CurrencyCode
   checkingUpdates: boolean
+  openRouterConfigured: boolean
   onCurrencyChange: (currency: CurrencyCode) => Promise<void>
+  onKeyConfigured: () => void
   onCheckUpdates: () => Promise<void>
   onClose: () => void
   onNotice: (message: string) => void
@@ -139,22 +149,22 @@ function PreferencesPanel({ currency, checkingUpdates, onCurrencyChange, onCheck
     setSaving(true)
     try {
       await onCurrencyChange(selectedCurrency)
-      if (key.trim()) await configureOpenRouter(key)
-      onNotice(key.trim() ? 'Preferences saved and OpenRouter connected' : 'Preferences saved')
+      if (key.trim()) { await configureOpenRouter(key); onKeyConfigured() }
+      onNotice(key.trim() ? 'Preferences and OpenRouter key saved' : 'Preferences saved')
       onClose()
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'OpenRouter is available in the desktop and mobile apps')
+      onNotice(errorMessage(error, 'Could not save the OpenRouter key'))
     } finally { setSaving(false) }
   }
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry preferences-panel" onSubmit={save}>
       <div className="entry-head"><div><span className="eyebrow">Preferences</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <label className="input-label"><span>Display currency</span><select value={selectedCurrency} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
-      <div className="privacy-callout"><KeyRound size={20}/><div><b>Your key stays on this device</b><span>Leafy sends only the transaction description to OpenRouter when Auto is selected. The key is held in app memory and is never committed or synced.</span></div></div>
-      <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder="sk-or-v1-..." value={key} onChange={event => setKey(event.target.value)} /></label>
+      <div className="privacy-callout"><KeyRound size={20}/><div><b>One key on your computer</b><span>The key is encrypted on this device. A paired phone asks the computer to categorize; the raw key is never copied to the phone.</span></div></div>
+      <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder={openRouterConfigured ? 'Saved securely — enter a new key to replace it' : 'sk-or-v1-...'} value={key} onChange={event => setKey(event.target.value)} />{openRouterConfigured && <small>An encrypted key is already saved on this device.</small>}</label>
       <div className="preferences-update"><div><b>App updates</b><span>Check GitHub Releases for the newest version of your installed channel.</span></div><button type="button" onClick={() => void onCheckUpdates()} disabled={checkingUpdates}><RefreshCw size={15} className={checkingUpdates ? 'spinning' : ''}/>{checkingUpdates ? 'Checking...' : 'Check for updates'}</button></div>
       <button className="save-button income" disabled={saving}>{saving ? 'Saving...' : 'Save preferences'}</button>
-      <p className="privacy-note">You can also set OPENROUTER_API_KEY before launching Leafy.</p>
+      <p className="privacy-note">Transactions, preferences, and the encrypted key stay in app data during in-place updates.</p>
     </form>
   </div>
 }
@@ -227,15 +237,15 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
   const [mode, setMode] = useState<'show' | 'scan'>('show')
   const [peer, setPeer] = useState<PairingDetails | null>(initialPeer)
   const [pairingText, setPairingText] = useState('')
-  const [status, setStatus] = useState(initialPeer ? 'Connected on your local network' : '')
+  const [status, setStatus] = useState(initialPeer ? `Connected through ${initialPeer.networkMode === 'tailscale' ? 'Tailscale' : 'your local network'}` : '')
   const [busy, setBusy] = useState(false)
 
   const showCode = async () => {
     setBusy(true); setStatus('Starting a private local connection...')
     try {
       const next = await createPairing(transactions)
-      await rememberPeer(next); setPeer(next); onPaired(next); setStatus('Ready for one hour. Scan this code with Leafy on your phone.')
-    } catch { setStatus('Open Leafy as a desktop app to create a pairing code.') }
+      await rememberPeer(next); setPeer(next); onPaired(next); setStatus(next.networkMode === 'tailscale' ? 'Tailscale found. Ready for one hour — scan this code on your phone.' : 'Ready for one hour on your local network — scan this code on your phone.')
+    } catch (error) { setStatus(errorMessage(error, 'Open Leafy as a desktop app to create a pairing code.')) }
     finally { setBusy(false) }
   }
 
@@ -246,14 +256,17 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
       const rows = await pullFromPeer(next)
       await rememberPeer(next); setPeer(next); onPaired(next); onMerge(rows)
       setStatus(`Connected. Imported ${rows.length} transactions.`)
-    } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not connect') }
+    } catch (error) {
+      const message = errorMessage(error, 'Could not connect')
+      setStatus(nextConnectionHint(details, pairingText, message))
+    }
     finally { setBusy(false) }
   }
 
   const scanCode = async () => {
     setBusy(true)
     try { await connect(await scanPairingCode()) }
-    catch (error) { setStatus(error instanceof Error ? error.message : 'Could not scan the code'); setBusy(false) }
+    catch (error) { setStatus(errorMessage(error, 'Could not scan the code')); setBusy(false) }
   }
 
   const disconnect = () => { forgetPeer(); setPeer(null); onPaired(null); setStatus('Device disconnected') }
@@ -263,7 +276,7 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
       <div className="entry-head"><div><span className="eyebrow">Private sync</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')}><Smartphone size={16}/> This phone</button></div>
       {mode === 'show' ? <div className="sync-content">
-        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b> and use Leafy's scanner—not the regular Camera app.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
+        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b>. Keep Tailscale connected on both devices; local Wi-Fi is used as a fallback.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Leafy prefers your private Tailscale network and falls back to the same local Wi-Fi.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
       </div> : <div className="sync-content scan-content">
         <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>The time-limited QR carries a pinned TLS certificate and a separate 256-bit encryption key. Your financial data remains end-to-end encrypted.</p>
         <button className="scan-button" onClick={scanCode} disabled={busy}><QrCode size={17}/>{busy ? 'Opening camera...' : 'Scan QR code'}</button>
@@ -275,10 +288,23 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
   </div>
 }
 
+function nextConnectionHint(details: PairingDetails | undefined, pairingText: string, message: string) {
+  let connection = details
+  if (!connection && pairingText.trim()) {
+    try { connection = parsePairing(pairingText.trim()) } catch { return message }
+  }
+  if (connection?.networkMode === 'tailscale' && /failed|connect|reach|timed? out/i.test(message)) {
+    return `${message} Keep Tailscale connected on both devices and allow leafy-financas.exe on private networks in Windows Firewall.`
+  }
+  return message
+}
+
 export default function App() {
   const [transactions, setTransactions, storageReady, storageError] = useTransactions()
   const [days, setDays] = useState(30)
   const [showBalance, setShowBalance] = useState(true)
+  const [preferencesReady, setPreferencesReady] = useState(false)
+  const [openRouterConfigured, setOpenRouterConfigured] = useState(false)
   const [entryOpen, setEntryOpen] = useState(false)
   const [preferencesOpen, setPreferencesOpen] = useState(false)
   const [syncOpen, setSyncOpen] = useState(false)
@@ -315,10 +341,27 @@ export default function App() {
   }
 
   useEffect(() => {
-    void secureGet<unknown>('currency').then(value => {
-      if (isCurrencyCode(value)) setCurrency(value)
-    }).catch(() => setToast('Currency preference could not be unlocked. Using BRL.'))
+    void (async () => {
+      try {
+        const [savedCurrency, dashboard, hasOpenRouter] = await Promise.all([
+          secureGet<unknown>('currency'),
+          secureGet<DashboardPreferences>('dashboard-preferences'),
+          restoreOpenRouter(),
+        ])
+        if (isCurrencyCode(savedCurrency)) setCurrency(savedCurrency)
+        if (dashboard && [7, 30, 90].includes(dashboard.days)) setDays(dashboard.days)
+        if (dashboard && typeof dashboard.showBalance === 'boolean') setShowBalance(dashboard.showBalance)
+        setOpenRouterConfigured(hasOpenRouter)
+      } catch {
+        setToast('Some saved preferences could not be unlocked. Defaults are being used.')
+      } finally { setPreferencesReady(true) }
+    })()
   }, [])
+
+  useEffect(() => {
+    if (preferencesReady) void secureSet('dashboard-preferences', { days, showBalance } satisfies DashboardPreferences)
+      .catch(() => setToast('Dashboard preferences could not be saved.'))
+  }, [days, preferencesReady, showBalance])
 
   useEffect(() => {
     const bridgeWindow = window as Window & { __leafyShareReady?: boolean }
@@ -431,7 +474,7 @@ export default function App() {
     setToast(row.type === 'expense' ? 'Expense saved' : 'Income saved')
     window.setTimeout(() => setToast(''), 2600)
     if (useAi) {
-      const category = await categorizeWithAi(row.description, row.type)
+      const category = await categorizeWithAi(row.description, row.type, peer)
       setTransactions(current => current.map(item => item.id === row.id ? { ...item, category } : item))
       setToast(`Categorized as ${category}`)
       window.setTimeout(() => setToast(''), 2600)
@@ -556,7 +599,7 @@ export default function App() {
       </main>
 
       {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} />}
-      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} onCheckUpdates={checkUpdates} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
+      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
       {syncOpen && <SyncPanel transactions={transactions} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onMerge={rows => setTransactions(current => mergeTransactions(current, rows))} />}
       {sharedReceipt && (
         <ReceiptReview source={sharedReceipt} onClose={() => setSharedReceipt(null)} onAdd={(row, useAi) => {

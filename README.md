@@ -68,14 +68,14 @@ npm run tauri android build -- --apk
 
 `Auto` is the default category. Leafy sends the transaction description to OpenRouter and accepts only one of the categories defined by the app. If the request fails or no key is configured, a small local ruleset makes the choice instead. Saving the transaction never depends on the network.
 
-Connect a key from Preferences for the current app session, or provide it before launch:
+Connect a key from Preferences to keep it encrypted in this device's app data, or provide it before launch:
 
 ```powershell
 $env:OPENROUTER_API_KEY="sk-or-v1-..."
 npm run tauri dev
 ```
 
-The key is not written to the repository, paired to another device, or included in screenshots. You can choose a different OpenRouter model with `LEAFY_OPENROUTER_MODEL`. The default is `openrouter/auto`.
+The raw key is not written to the repository, copied into pairing codes, sent to another device, or included in screenshots. When a paired phone needs AI categorization, it sends only the transaction description through the pinned private channel and the computer makes the OpenRouter request. The computer must be running and reachable. You can choose a different OpenRouter model with `LEAFY_OPENROUTER_MODEL`. The default is `openrouter/auto`.
 
 ## Share a receipt from Android
 
@@ -93,13 +93,15 @@ The receipt currency must match the ledger currency selected in Preferences. Lea
 
 ## Private device sync
 
-The desktop app starts a one-hour HTTPS endpoint on a random port in your local network. Its self-signed certificate is pinned directly from the QR code, so Leafy never disables certificate or hostname verification. The QR carries independent secrets for transport authentication and content encryption:
+The desktop app starts a one-hour HTTPS endpoint on a random port. It prefers the computer's Tailscale adapter, which keeps the endpoint reachable only according to that user's tailnet policy, and falls back to the local network. Its self-signed certificate is pinned directly from the QR code, so Leafy never disables certificate or hostname verification. The QR carries independent secrets for transport authentication and content encryption:
 
 - a 256-bit AES-GCM key used before financial data leaves the device
 - a separate 256-bit bearer token compared in constant time
 - the ephemeral TLS certificate and a random session identifier
 
-The encryption key is never sent in a network request. The native client accepts only `https://` endpoints on private IP addresses, rejects redirects and public hosts, caps payload size, and binds ciphertext to its session with authenticated additional data. Pairing details and the ledger are encrypted locally with a non-exportable device key. Legacy plaintext storage is removed after a successful migration.
+The encryption key is never sent in a network request. The native client accepts only `https://` endpoints on local/private addresses or Tailscale's `100.64.0.0/10` range, rejects redirects and public hosts, caps payload size, and binds ciphertext to its session with authenticated additional data. Pairing details, the ledger, preferences, and an optional OpenRouter key are encrypted locally with a non-exportable device key. In-place app updates keep this app-data store; legacy plaintext storage is removed after a successful migration.
+
+If Windows Firewall was previously told to block `leafy-financas.exe`, an explicit block overrides every allow rule and the phone cannot connect. Run `scripts/configure-windows-tailscale-firewall.ps1` once from an elevated PowerShell prompt. It disables only TCP block rules for the installed Leafy executable and adds an inbound rule restricted to Tailscale's IPv4 range on private network profiles.
 
 ## Release channels
 

@@ -12,6 +12,7 @@ export type PairingDetails = {
   sessionId: string
   expiresAt: string
   deviceName: string
+  networkMode?: 'tailscale' | 'local'
 }
 
 type SyncEnvelope = {
@@ -64,7 +65,7 @@ export async function createPairing(transactions: Transaction[]): Promise<Pairin
   const token = encode(crypto.getRandomValues(new Uint8Array(32)))
   const sessionId = encode(crypto.getRandomValues(new Uint8Array(16)))
   const payload = await encryptSnapshot(transactions, key, sessionId)
-  const { endpoint, certificate } = await invoke<{ endpoint: string; certificate: string }>('start_pairing_server', { token, payload })
+  const { endpoint, certificate, networkMode } = await invoke<{ endpoint: string; certificate: string; networkMode: 'tailscale' | 'local' }>('start_pairing_server', { token, payload })
   return {
     version: 2,
     endpoint,
@@ -74,6 +75,7 @@ export async function createPairing(transactions: Transaction[]): Promise<Pairin
     sessionId,
     expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     deviceName: 'Leafy Desktop',
+    networkMode,
   }
 }
 
@@ -87,6 +89,7 @@ export function serializePairing(details: PairingDetails) {
     s: details.sessionId,
     x: details.expiresAt,
     d: details.deviceName,
+    ...(details.networkMode ? { n: details.networkMode } : {}),
   })
   return `leafy://pair?${query}`
 }
@@ -107,6 +110,7 @@ export function parsePairing(value: string): PairingDetails {
         sessionId: url.searchParams.get('s') ?? '',
         expiresAt: url.searchParams.get('x') ?? '',
         deviceName: url.searchParams.get('d') ?? 'Leafy Desktop',
+        ...(url.searchParams.has('n') ? { networkMode: url.searchParams.get('n') === 'tailscale' ? 'tailscale' as const : 'local' as const } : {}),
       } as PairingDetails
   if (details.version !== 2 || !details.endpoint || !details.token || !details.key || !details.certificate || !details.sessionId) throw new Error('Unsupported pairing code')
   if (decode(details.token).length !== 32 || decode(details.key).length !== 32 || decode(details.sessionId).length !== 16) throw new Error('Invalid pairing secrets')

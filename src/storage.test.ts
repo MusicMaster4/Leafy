@@ -28,6 +28,14 @@ describe('encrypted local storage', () => {
     await expect(secureGet('peer')).rejects.toThrow()
   })
 
+  it('seals API keys and preferences for persistence across app updates', async () => {
+    await secureSet('openrouter-key', 'sk-or-v1-fictional-test-key')
+    await secureSet('dashboard-preferences', { days: 90, showBalance: false })
+    expect(values.get('leafy-secure:openrouter-key')).not.toContain('fictional-test-key')
+    await expect(secureGet('openrouter-key')).resolves.toBe('sk-or-v1-fictional-test-key')
+    await expect(secureGet('dashboard-preferences')).resolves.toEqual({ days: 90, showBalance: false })
+  })
+
   it('removes encrypted records', async () => {
     await secureSet('peer', { token: 'fictional' })
     secureRemove('peer')
