@@ -116,11 +116,14 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.LEAFY_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           tagName: ${{ needs.version.outputs.tag }}
           releaseName: Leafy ${{ needs.version.outputs.tag }}
           releaseDraft: true
           prerelease: ${{ needs.version.outputs.channel == 'testing' }}
+          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
 
   android:

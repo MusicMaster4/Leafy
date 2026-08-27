@@ -17,7 +17,10 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tauri::{AppHandle, State};
-use tauri_plugin_opener::OpenerExt;
+#[cfg(desktop)]
+use tauri::{Emitter, Manager};
+#[cfg(desktop)]
+use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::RwLock;
 
 const MAX_SYNC_BYTES: usize = 5_000_000;
@@ -89,7 +92,6 @@ struct ChatAnswer {
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
-    html_url: String,
     prerelease: bool,
     assets: Vec<GithubAsset>,
 }
@@ -106,8 +108,26 @@ struct UpdateCheck {
     current_version: String,
     latest_version: String,
     available: bool,
-    release_url: String,
     apk_url: Option<String>,
+    updater_url: String,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Serialize)]
+struct UpdateProgress {
+    percent: u8,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Serialize)]
+struct UpdateStatus<'a> {
+    status: &'a str,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Serialize)]
+struct UpdateError<'a> {
+    message: &'a str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +195,26 @@ fn trusted_apk_url(url: &str) -> bool {
     })
 }
 
+fn trusted_updater_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        let parts = url
+            .path_segments()
+            .map(|segments| segments.collect::<Vec<_>>())
+            .unwrap_or_default();
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && parts.len() == 6
+            && parts[..4] == ["MusicMaster4", "Leafy", "releases", "download"]
+            && parse_release_version(parts[4]).is_some()
+            && parts[5] == "latest.json"
+    })
+}
+
 #[tauri::command]
 async fn check_for_updates() -> Result<UpdateCheck, String> {
     const MAX_RELEASE_BYTES: usize = 512 * 1024;
@@ -232,31 +272,66 @@ async fn check_for_updates() -> Result<UpdateCheck, String> {
         current_version,
         latest_version: release.tag_name.trim_start_matches('v').to_string(),
         available: latest > current,
-        release_url: release.html_url.clone(),
         apk_url,
+        updater_url: format!(
+            "https://github.com/MusicMaster4/Leafy/releases/download/{}/latest.json",
+            release.tag_name
+        ),
     })
 }
 
+#[cfg(desktop)]
 #[tauri::command]
-fn open_release(release_url: String, app: AppHandle) -> Result<(), String> {
-    let url = reqwest::Url::parse(&release_url).map_err(|_| "Invalid release URL")?;
-    if !trusted_release_url(&url) {
-        return Err("Untrusted release URL".into());
+async fn install_desktop_update(updater_url: String, app: AppHandle) -> Result<(), String> {
+    if !trusted_updater_url(&updater_url) {
+        return Err("Leafy refused an untrusted update address".into());
     }
-    app.opener()
-        .open_url(url.as_str(), None::<String>)
-        .map_err(|_| "Could not open GitHub Releases".into())
-}
+    let endpoint = updater_url
+        .parse()
+        .map_err(|_| "The update address is invalid")?;
+    let update = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|_| "Could not prepare the updater")?
+        .build()
+        .map_err(|_| "Could not prepare the updater")?
+        .check()
+        .await
+        .map_err(|_| "Could not verify the available update")?
+        .ok_or("The update is no longer available")?;
 
-fn trusted_release_url(url: &reqwest::Url) -> bool {
-    url.scheme() == "https"
-        && url.host_str() == Some("github.com")
-        && url.username().is_empty()
-        && url.password().is_none()
-        && url.port().is_none()
-        && url.query().is_none()
-        && url.fragment().is_none()
-        && url.path().starts_with("/MusicMaster4/Leafy/releases/")
+    let progress_app = app.clone();
+    let installing_app = app.clone();
+    let mut downloaded = 0_u64;
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                downloaded = downloaded.saturating_add(chunk_length as u64);
+                if let Some(total) = content_length.filter(|total| *total > 0) {
+                    let percent = ((downloaded.saturating_mul(100) / total).min(100)) as u8;
+                    let _ = progress_app.emit("leafy:update-progress", UpdateProgress { percent });
+                }
+            },
+            move || {
+                let _ = installing_app.emit(
+                    "leafy:update-status",
+                    UpdateStatus {
+                        status: "installing",
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|_| {
+            let _ = app.emit(
+                "leafy:update-error",
+                UpdateError {
+                    message: "Leafy could not securely install this update.",
+                },
+            );
+            "Could not download or install the update"
+        })?;
+    app.restart();
 }
 
 #[tauri::command]
@@ -724,7 +799,17 @@ fn take_sync_update(state: State<'_, AppState>) -> Result<Option<String>, String
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     ensure_crypto_provider();
-    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
+    let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     builder
@@ -738,7 +823,8 @@ pub fn run() {
             categorize_via_peer,
             take_sync_update,
             check_for_updates,
-            open_release
+            #[cfg(desktop)]
+            install_desktop_update
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Leafy");
@@ -765,18 +851,19 @@ mod security_tests {
     }
 
     #[test]
-    fn opens_only_official_leafy_release_pages() {
-        let valid =
-            reqwest::Url::parse("https://github.com/MusicMaster4/Leafy/releases/tag/v0.1.5")
-                .unwrap();
-        let lookalike =
-            reqwest::Url::parse("https://github.com.evil.test/MusicMaster4/Leafy/releases/tag/v9")
-                .unwrap();
-        let wrong_repo =
-            reqwest::Url::parse("https://github.com/other/Leafy/releases/tag/v9").unwrap();
-        assert!(trusted_release_url(&valid));
-        assert!(!trusted_release_url(&lookalike));
-        assert!(!trusted_release_url(&wrong_repo));
+    fn accepts_only_official_leafy_updater_manifests() {
+        assert!(trusted_updater_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v0.1.6-testing.6/latest.json"
+        ));
+        assert!(!trusted_updater_url(
+            "https://github.com.evil.test/MusicMaster4/Leafy/releases/download/v9/latest.json"
+        ));
+        assert!(!trusted_updater_url(
+            "https://github.com/other/Leafy/releases/download/v9/latest.json"
+        ));
+        assert!(!trusted_updater_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v9/not-latest.json"
+        ));
     }
 
     #[test]

@@ -4,8 +4,8 @@ export interface UpdateCheck {
   currentVersion: string
   latestVersion: string
   available: boolean
-  releaseUrl: string
   apkUrl: string | null
+  updaterUrl: string
 }
 
 declare global {
@@ -15,9 +15,9 @@ declare global {
 }
 
 export const checkForUpdates = () => invoke<UpdateCheck>('check_for_updates')
-export const openRelease = (releaseUrl: string) => invoke<void>('open_release', { releaseUrl })
 export const canInstallAndroidUpdate = () => typeof window.LeafyAndroid?.installUpdate === 'function'
 export const installAndroidUpdate = (apkUrl: string) => {
   if (!window.LeafyAndroid) throw new Error('Android installer is unavailable')
   window.LeafyAndroid.installUpdate(apkUrl)
 }
+export const installDesktopUpdate = (updaterUrl: string) => invoke<void>('install_desktop_update', { updaterUrl })

@@ -219,8 +219,8 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
 .update-notice > div { min-width: 0; display: grid; gap: 3px; }
 .update-notice b { font-size: 11px; font-weight: 650; }
 .update-notice div span { overflow: hidden; color: #838a83; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
-.view-release-button { padding: 8px 10px; border: 0; border-radius: 4px; background: var(--green); color: #151a10; font-size: 9px; font-weight: 700; white-space: nowrap; cursor: pointer; }
-.view-release-button:disabled { opacity: .7; cursor: wait; }
+.install-update-button { padding: 8px 10px; border: 0; border-radius: 4px; background: var(--green); color: #151a10; font-size: 9px; font-weight: 700; white-space: nowrap; cursor: pointer; }
+.install-update-button:disabled { opacity: .7; cursor: wait; }
 .dismiss-update { width: 28px; height: 28px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 4px; background: transparent; color: #747b74; cursor: pointer; }
 .dismiss-update:hover { color: #e0e4de; background: #232824; }
 .mobile-add-button { display: none; }
@@ -290,7 +290,7 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
   .preferences-update button { min-height: 44px; justify-content: center; }
   .toast { bottom: calc(76px + env(safe-area-inset-bottom)); max-width: calc(100vw - 32px); white-space: nowrap; }
   .update-notice { right: 16px; bottom: calc(76px + env(safe-area-inset-bottom)); grid-template-columns: 34px minmax(0, 1fr) auto; }
-  .view-release-button { grid-column: 2; justify-self: start; }
+  .install-update-button { grid-column: 2; justify-self: start; }
   .dismiss-update { position: absolute; top: 8px; right: 8px; }
 }
 

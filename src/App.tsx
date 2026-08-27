@@ -26,7 +26,8 @@ import {
   createPairing, forgetPeer, mergeTransactions, parsePairing, pullFromPeer, pushToPeer,
   rememberPeer, savedPeer, scanPairingCode, serializePairing, type PairingDetails,
 } from './sync'
-import { canInstallAndroidUpdate, checkForUpdates, installAndroidUpdate, openRelease, type UpdateCheck } from './updates'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { canInstallAndroidUpdate, checkForUpdates, installAndroidUpdate, installDesktopUpdate, type UpdateCheck } from './updates'
 
 const COLORS: Record<string, string> = {
   Food: '#d9a441', Housing: '#718bdb', Transport: '#51a98e', Leisure: '#d86f91',
@@ -401,7 +402,7 @@ export default function App() {
     const status = (event: Event) => {
       const value = (event as CustomEvent<{ status?: unknown }>).detail?.status
       if (value === 'permission') setToast('Allow Leafy to install apps, then return to continue.')
-      if (value === 'installing') setToast('Update downloaded. Confirm the installation in Android.')
+      if (value === 'installing') setToast(canInstallAndroidUpdate() ? 'Update downloaded. Confirm the installation in Android.' : 'Update downloaded. Leafy is installing it now.')
     }
     const error = (event: Event) => {
       const message = (event as CustomEvent<{ message?: unknown }>).detail?.message
@@ -411,7 +412,19 @@ export default function App() {
     window.addEventListener('leafy:update-progress', progress)
     window.addEventListener('leafy:update-status', status)
     window.addEventListener('leafy:update-error', error)
+    const unlisten: UnlistenFn[] = []
+    let active = true
+    void Promise.all([
+      listen<{ percent?: unknown }>('leafy:update-progress', event => progress(new CustomEvent('leafy:update-progress', { detail: event.payload }))),
+      listen<{ status?: unknown }>('leafy:update-status', event => status(new CustomEvent('leafy:update-status', { detail: event.payload }))),
+      listen<{ message?: unknown }>('leafy:update-error', event => error(new CustomEvent('leafy:update-error', { detail: event.payload }))),
+    ]).then(callbacks => {
+      if (active) unlisten.push(...callbacks)
+      else callbacks.forEach(callback => callback())
+    }).catch(() => undefined)
     return () => {
+      active = false
+      unlisten.forEach(callback => callback())
       window.removeEventListener('leafy:update-progress', progress)
       window.removeEventListener('leafy:update-status', status)
       window.removeEventListener('leafy:update-error', error)
@@ -502,15 +515,20 @@ export default function App() {
     }
   }
 
-  const installAvailableUpdate = () => {
-    if (!availableUpdate?.apkUrl) return
+  const installAvailableUpdate = async () => {
+    if (!availableUpdate) return
     try {
       setInstallingUpdate(true)
       setUpdateProgress(0)
-      installAndroidUpdate(availableUpdate.apkUrl)
-    } catch {
+      if (canInstallAndroidUpdate()) {
+        if (!availableUpdate.apkUrl) throw new Error('Android update package is unavailable')
+        installAndroidUpdate(availableUpdate.apkUrl)
+      } else {
+        await installDesktopUpdate(availableUpdate.updaterUrl)
+      }
+    } catch (error) {
       setInstallingUpdate(false)
-      setToast('The Android installer is unavailable.')
+      setToast(errorMessage(error, 'Could not download and install the update.'))
     }
   }
 
@@ -611,9 +629,7 @@ export default function App() {
       {availableUpdate && <div className="update-notice" role="status">
         <span className="update-notice-icon"><RefreshCw size={17}/></span>
         <div><b>Update available</b><span>Leafy {availableUpdate.latestVersion} is ready to download.</span></div>
-        {canInstallAndroidUpdate() && availableUpdate.apkUrl
-          ? <button type="button" className="view-release-button" onClick={installAvailableUpdate} disabled={installingUpdate}>{installingUpdate ? `Downloading ${updateProgress}%` : 'Download and install'}</button>
-          : <button type="button" className="view-release-button" onClick={() => void openRelease(availableUpdate.releaseUrl).catch(() => setToast('Could not open GitHub Releases.'))}>View release</button>}
+        <button type="button" className="install-update-button" onClick={() => void installAvailableUpdate()} disabled={installingUpdate}>{installingUpdate ? `Downloading ${updateProgress}%` : 'Download and install'}</button>
         <button type="button" className="dismiss-update" aria-label="Dismiss update notice" onClick={() => setAvailableUpdate(null)}><X size={16}/></button>
       </div>}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
