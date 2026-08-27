@@ -3,6 +3,7 @@ import { decryptSnapshot, encryptSnapshot } from './sync'
 import type { Transaction } from './types'
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
+const decode = (value: string) => Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4)), char => char.charCodeAt(0))
 const key = encode(new Uint8Array(32).fill(7))
 const session = encode(new Uint8Array(16).fill(9))
 const rows: Transaction[] = [{
@@ -23,7 +24,10 @@ describe('private sync envelope', () => {
 
   it('rejects tampering and cross-session replay', async () => {
     const sealed = await encryptSnapshot(rows, key, session)
-    const tampered = `${sealed.slice(0, -1)}${sealed.endsWith('A') ? 'B' : 'A'}`
+    const [iv, encodedCiphertext] = sealed.split('.')
+    const changedCiphertext = decode(encodedCiphertext)
+    changedCiphertext[0] ^= 1
+    const tampered = `${iv}.${encode(changedCiphertext)}`
     await expect(decryptSnapshot(tampered, key, session)).rejects.toThrow()
     await expect(decryptSnapshot(sealed, key, encode(new Uint8Array(16).fill(8)))).rejects.toThrow()
   })
