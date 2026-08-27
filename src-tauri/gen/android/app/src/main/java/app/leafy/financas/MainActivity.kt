@@ -18,7 +18,9 @@ import androidx.core.content.FileProvider
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.net.HttpURLConnection
@@ -35,6 +37,7 @@ class MainActivity : TauriActivity() {
     private const val MAX_TEXT_CHARS = 150_000
     private const val MAX_IMAGE_EDGE = 2048
     private const val SHARE_CONSUMED = "app.leafy.financas.SHARE_CONSUMED"
+    private const val MAX_RELEASE_BYTES = 64L * 1024L
     private const val MAX_UPDATE_BYTES = 200L * 1024L * 1024L
     private const val MAX_UPDATE_REDIRECTS = 5
   }
@@ -47,9 +50,12 @@ class MainActivity : TauriActivity() {
   @Volatile private var pendingUpdateFile: File? = null
   private var leafyWebView: WebView? = null
 
+  private external fun initTlsVerifier()
+
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    initTlsVerifier()
   }
 
   override fun onWebViewCreate(webView: WebView) {
@@ -83,12 +89,101 @@ class MainActivity : TauriActivity() {
 
   private inner class UpdateBridge {
     @JavascriptInterface
+    fun checkForUpdates() {
+      updateExecutor.execute { checkForAndroidUpdate() }
+    }
+
+    @JavascriptInterface
     fun installUpdate(downloadUrl: String) {
       if (!isOfficialUpdateUrl(downloadUrl, false)) {
         emitUpdateError("Leafy refused an untrusted update address.")
         return
       }
       updateExecutor.execute { downloadAndInstallUpdate(downloadUrl) }
+    }
+  }
+
+  private data class ReleaseVersion(val core: List<Long>, val testing: Long?) : Comparable<ReleaseVersion> {
+    override fun compareTo(other: ReleaseVersion): Int {
+      core.zip(other.core).firstOrNull { (left, right) -> left != right }?.let { (left, right) ->
+        return left.compareTo(right)
+      }
+      return when {
+        testing == null && other.testing != null -> 1
+        testing != null && other.testing == null -> -1
+        else -> (testing ?: 0).compareTo(other.testing ?: 0)
+      }
+    }
+  }
+
+  private fun parseReleaseVersion(value: String): ReleaseVersion? {
+    val match = Regex("^v?(\\d+)\\.(\\d+)\\.(\\d+)(?:-testing\\.(\\d+))?$").matchEntire(value.trim())
+      ?: return null
+    return try {
+      ReleaseVersion(
+        listOf(match.groupValues[1].toLong(), match.groupValues[2].toLong(), match.groupValues[3].toLong()),
+        match.groupValues[4].takeIf { it.isNotEmpty() }?.toLong(),
+      )
+    } catch (_: NumberFormatException) { null }
+  }
+
+  private fun checkForAndroidUpdate() {
+    var connection: HttpURLConnection? = null
+    try {
+      val currentVersion = BuildConfig.VERSION_NAME
+      val current = requireNotNull(parseReleaseVersion(currentVersion)) { "Invalid installed version" }
+      val testingChannel = current.testing != null
+      val endpoint = if (testingChannel) {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases?per_page=1"
+      } else {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases/latest"
+      }
+      connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+        instanceFollowRedirects = false
+        connectTimeout = 4_000
+        readTimeout = 6_000
+        setRequestProperty("Accept", "application/vnd.github+json")
+        setRequestProperty("User-Agent", "Leafy Android update checker")
+      }
+      require(connection.responseCode in 200..299) { "Update server returned ${connection.responseCode}" }
+      val expected = connection.contentLengthLong
+      require(expected <= MAX_RELEASE_BYTES) { "Update response is too large" }
+      val output = ByteArrayOutputStream()
+      connection.inputStream.use { input ->
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+          val count = input.read(buffer)
+          if (count < 0) break
+          require(output.size() + count <= MAX_RELEASE_BYTES) { "Update response is too large" }
+          output.write(buffer, 0, count)
+        }
+      }
+      val body = output.toString(Charsets.UTF_8.name())
+      val release = if (testingChannel) JSONArray(body).getJSONObject(0) else JSONObject(body)
+      val tag = release.getString("tag_name")
+      val latest = requireNotNull(parseReleaseVersion(tag)) { "Invalid release version" }
+      val expectedApk = if (release.optBoolean("prerelease")) "leafy-beta.apk" else "leafy.apk"
+      val assets = release.getJSONArray("assets")
+      var apkUrl: String? = null
+      for (index in 0 until assets.length()) {
+        val asset = assets.getJSONObject(index)
+        if (asset.optString("name") == expectedApk) {
+          val candidate = asset.getString("browser_download_url")
+          if (isOfficialUpdateUrl(candidate, false)) apkUrl = candidate
+          break
+        }
+      }
+      val payload = JSONObject()
+        .put("currentVersion", currentVersion)
+        .put("latestVersion", tag.removePrefix("v"))
+        .put("available", latest > current)
+        .put("apkUrl", apkUrl ?: JSONObject.NULL)
+        .put("updaterUrl", "https://github.com/MusicMaster4/Leafy/releases/download/$tag/latest.json")
+      queueEvent("leafy:update-check-result", payload)
+    } catch (_: Exception) {
+      queueEvent("leafy:update-check-error", JSONObject().put("message", "Could not reach GitHub Releases."))
+    } finally {
+      connection?.disconnect()
     }
   }
 

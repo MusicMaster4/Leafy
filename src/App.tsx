@@ -586,18 +586,21 @@ export default function App() {
 
   const checkUpdates = async () => {
     setCheckingUpdates(true)
+    let completed = false
     try {
       const update = await checkForUpdates()
+      completed = true
       if (update.available) {
         setAvailableUpdate(update)
         setToast('')
       } else setToast(`Leafy ${update.currentVersion} is up to date`)
-    } catch {
-      setToast('Could not check for updates. Try again in a moment.')
+    } catch (error) {
+      const timedOut = error instanceof Error && error.message.toLowerCase().includes('timed out')
+      setToast(timedOut ? 'Update check took too long. Check your connection and try again.' : 'Could not check for updates. Try again in a moment.')
     } finally {
       setCheckingUpdates(false)
       setProfileMenuOpen(false)
-      setPreferencesOpen(false)
+      if (completed) setPreferencesOpen(false)
       window.setTimeout(() => setToast(''), 4200)
     }
   }

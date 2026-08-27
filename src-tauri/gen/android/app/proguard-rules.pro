@@ -19,3 +19,6 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# reqwest uses this JNI bridge to validate TLS with Android's certificate store.
+-keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }

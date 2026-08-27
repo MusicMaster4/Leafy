@@ -16,9 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tauri::{AppHandle, State};
+use tauri::State;
 #[cfg(desktop)]
-use tauri::{Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 #[cfg(desktop)]
 use tauri_plugin_updater::UpdaterExt;
 use tokio::sync::RwLock;
@@ -28,6 +28,17 @@ const SYNC_SESSION_SECONDS: u64 = 60 * 60;
 
 fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
+#[cfg(target_os = "android")]
+#[export_name = "Java_app_leafy_financas_MainActivity_initTlsVerifier"]
+pub extern "C" fn init_android_tls_verifier<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    activity: jni::objects::JObject<'local>,
+) {
+    use jni::errors::ThrowRuntimeExAndDefault;
+    env.with_env(|env| rustls_platform_verifier::android::init_with_env(env, activity))
+        .resolve::<ThrowRuntimeExAndDefault>()
 }
 
 #[derive(Default)]
@@ -92,7 +103,6 @@ struct ChatAnswer {
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
-    prerelease: bool,
     assets: Vec<GithubAsset>,
 }
 
@@ -195,6 +205,7 @@ fn trusted_apk_url(url: &str) -> bool {
     })
 }
 
+#[cfg(any(desktop, test))]
 fn trusted_updater_url(url: &str) -> bool {
     reqwest::Url::parse(url).is_ok_and(|url| {
         let parts = url
@@ -217,15 +228,23 @@ fn trusted_updater_url(url: &str) -> bool {
 
 #[tauri::command]
 async fn check_for_updates() -> Result<UpdateCheck, String> {
-    const MAX_RELEASE_BYTES: usize = 512 * 1024;
+    const MAX_RELEASE_BYTES: usize = 64 * 1024;
     let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let current =
+        parse_release_version(&current_version).ok_or("The current app version is invalid")?;
+    let testing_channel = current.testing.is_some();
+    let endpoint = if testing_channel {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases?per_page=1"
+    } else {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases/latest"
+    };
     let response = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(12))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| "Could not prepare the update check")?
-        .get("https://api.github.com/repos/MusicMaster4/Leafy/releases?per_page=20")
+        .get(endpoint)
         .header("Accept", "application/vnd.github+json")
         .header("User-Agent", "Leafy update checker")
         .send()
@@ -247,18 +266,17 @@ async fn check_for_updates() -> Result<UpdateCheck, String> {
     if bytes.len() > MAX_RELEASE_BYTES {
         return Err("GitHub Releases returned an oversized response".into());
     }
-    let releases: Vec<GithubRelease> = serde_json::from_slice(&bytes)
-        .map_err(|_| "GitHub Releases returned an invalid response")?;
-    let current =
-        parse_release_version(&current_version).ok_or("The current app version is invalid")?;
-    let testing_channel = current.testing.is_some();
-    let (release, latest) = releases
-        .iter()
-        .filter(|release| testing_channel || !release.prerelease)
-        .filter_map(|release| {
-            parse_release_version(&release.tag_name).map(|version| (release, version))
-        })
-        .max_by_key(|(_, version)| *version)
+    let release: GithubRelease = if testing_channel {
+        serde_json::from_slice::<Vec<GithubRelease>>(&bytes)
+            .map_err(|_| "GitHub Releases returned an invalid response")?
+            .into_iter()
+            .next()
+            .ok_or("GitHub Releases did not return a compatible release")?
+    } else {
+        serde_json::from_slice(&bytes)
+            .map_err(|_| "GitHub Releases returned an invalid response")?
+    };
+    let latest = parse_release_version(&release.tag_name)
         .ok_or("GitHub Releases did not return a compatible release")?;
     let apk_url = release
         .assets
@@ -560,24 +578,48 @@ fn is_tailscale_ipv4(value: std::net::Ipv4Addr) -> bool {
     octets[0] == 100 && (64..=127).contains(&octets[1])
 }
 
+fn is_pairing_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(value) => {
+            !value.is_loopback() && (value.is_private() || is_tailscale_ipv4(value))
+        }
+        IpAddr::V6(value) => !value.is_loopback() && value.is_unique_local(),
+    }
+}
+
 fn sync_address() -> Result<(IpAddr, bool), String> {
     if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
-        if let Some((_, address)) = interfaces.into_iter().find(|(name, address)| {
+        if let Some((_, address)) = interfaces.iter().find(|(name, address)| {
             name.to_ascii_lowercase().contains("tailscale")
                 && match address {
                     IpAddr::V4(value) => is_tailscale_ipv4(*value),
                     IpAddr::V6(value) => value.is_unique_local(),
                 }
         }) {
-            return Ok((address, true));
+            return Ok((*address, true));
+        }
+        if let Ok(address) = local_ip_address::local_ip() {
+            if is_pairing_address(address) {
+                let tailscale = matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(value));
+                return Ok((address, tailscale));
+            }
+        }
+        if let Some((_, address)) = interfaces
+            .into_iter()
+            .find(|(_, address)| is_pairing_address(*address))
+        {
+            let tailscale = matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(value));
+            return Ok((address, tailscale));
         }
     }
     local_ip_address::local_ip()
+        .ok()
+        .filter(|address| is_pairing_address(*address))
         .map(|address| {
             let tailscale = matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(value));
             (address, tailscale)
         })
-        .map_err(|error| format!("Could not find a local or Tailscale address: {error}"))
+        .ok_or_else(|| "Could not find a private local or Tailscale address".into())
 }
 
 #[tauri::command]
@@ -590,7 +632,12 @@ async fn start_pairing_server(
     if !valid_ciphertext(&payload) {
         return Err("Invalid encrypted sync payload".into());
     }
-    let listener = TcpListener::bind("0.0.0.0:0")
+    let (address, tailscale) = sync_address()?;
+    let unspecified = match address {
+        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    };
+    let listener = TcpListener::bind(std::net::SocketAddr::new(unspecified, 0))
         .map_err(|error| format!("Could not start pairing: {error}"))?;
     listener
         .set_nonblocking(true)
@@ -599,7 +646,6 @@ async fn start_pairing_server(
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let (address, tailscale) = sync_address()?;
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec![address.to_string()])
         .map_err(|error| format!("Could not create the private TLS session: {error}"))?;
     let certificate = cert.der().to_vec();
@@ -644,9 +690,7 @@ fn private_sync_url(endpoint: &str) -> Result<reqwest::Url, String> {
     {
         return Err("The sync endpoint is not allowed".into());
     }
-    let host = url
-        .host_str()
-        .ok_or("The sync endpoint has no address")?;
+    let host = url.host_str().ok_or("The sync endpoint has no address")?;
     // URL serialization wraps IPv6 hosts in brackets. Remove only that
     // syntactic pair before parsing the literal address.
     let host = host
@@ -914,6 +958,18 @@ mod security_tests {
         assert!(private_sync_url("https://8.8.8.8/sync").is_err());
         assert!(private_sync_url("https://192.168.1.20/other").is_err());
         assert!(private_sync_url("https://user:pass@192.168.1.20/sync").is_err());
+    }
+
+    #[test]
+    fn advertises_only_reachable_private_pairing_addresses() {
+        assert!(is_pairing_address("192.168.1.20".parse().unwrap()));
+        assert!(is_pairing_address("10.0.0.2".parse().unwrap()));
+        assert!(is_pairing_address("100.100.20.3".parse().unwrap()));
+        assert!(is_pairing_address("fd7a:115c:a1e0::1234".parse().unwrap()));
+        assert!(!is_pairing_address("127.0.0.1".parse().unwrap()));
+        assert!(!is_pairing_address("169.254.20.3".parse().unwrap()));
+        assert!(!is_pairing_address("8.8.8.8".parse().unwrap()));
+        assert!(!is_pairing_address("2001:4860:4860::8888".parse().unwrap()));
     }
 
     #[test]
