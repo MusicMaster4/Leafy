@@ -1,6 +1,6 @@
 import { createContext, FormEvent, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowDownRight, ArrowLeftRight, ArrowUpRight, Bell, ChevronDown, CircleDollarSign,
+  ArrowDownRight, ArrowLeftRight, ArrowUpRight, ChevronDown, CircleDollarSign,
   AlertTriangle, Eye, EyeOff, FileCheck2, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
   ReceiptText, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Trash2, TrendingUp, Unplug,
   WalletCards, WandSparkles, X,
@@ -68,11 +68,11 @@ function StatCard({ label, value, type, note, hidden }: { label: string; value: 
   const Icon = type === 'income' ? ArrowUpRight : type === 'expense' ? ArrowDownRight : WalletCards
   const currency = useCurrency()
   return (
-    <div className={`stat-card ${type}`}>
+    <article className={`stat-card ${type}`}>
       <div className="stat-top"><span>{label}</span><span className="stat-icon"><Icon size={18} /></span></div>
       <strong>{hidden ? `${currencyDetails(currency).symbol} •••••` : money(value, false, currency)}</strong>
       <small>{note}</small>
-    </div>
+    </article>
   )
 }
 
@@ -106,7 +106,7 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
     <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}>
       <form className="quick-entry" onSubmit={submit}>
         <div className="entry-head">
-          <div><span className="eyebrow">QUICK ENTRY</span><h2>What happened?</h2></div>
+          <div><span className="eyebrow">Quick entry</span><h2>What happened?</h2></div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20} /></button>
         </div>
         <div className="type-switch">
@@ -146,7 +146,7 @@ function PreferencesPanel({ currency, onCurrencyChange, onClose, onNotice }: {
   }
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry preferences-panel" onSubmit={save}>
-      <div className="entry-head"><div><span className="eyebrow">PREFERENCES</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
+      <div className="entry-head"><div><span className="eyebrow">Preferences</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <label className="input-label"><span>Display currency</span><select value={selectedCurrency} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
       <div className="privacy-callout"><KeyRound size={20}/><div><b>Your key stays on this device</b><span>Leafy sends only the transaction description to OpenRouter when Auto is selected. The key is held in app memory and is never committed or synced.</span></div></div>
       <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder="sk-or-v1-..." value={key} onChange={event => setKey(event.target.value)} /></label>
@@ -190,7 +190,7 @@ function ReceiptReview({ source, onClose, onAdd }: {
   return <div className="modal-backdrop receipt-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry receipt-review" onSubmit={submit}>
       <div className="entry-head">
-        <div><span className="eyebrow">SHARED RECEIPT</span><h2>Review before saving</h2></div>
+        <div><span className="eyebrow">Shared receipt</span><h2>Review before saving</h2></div>
         <button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button>
       </div>
       <div className="receipt-source"><FileCheck2 size={20}/><div><b>{source.name}</b><span>Read locally on this device</span></div><em className={detected.confidence}>{detected.confidence} confidence</em></div>
@@ -257,10 +257,10 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
   const code = peer ? serializePairing(peer) : ''
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <div className="quick-entry sync-panel">
-      <div className="entry-head"><div><span className="eyebrow">PRIVATE SYNC</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
+      <div className="entry-head"><div><span className="eyebrow">Private sync</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')}><Smartphone size={16}/> This phone</button></div>
       {mode === 'show' ? <div className="sync-content">
-        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={240} level="L" bgColor="#f3fff8" fgColor="#10251b" /></div><p>Open Leafy on your phone, choose <b>Devices</b>, then scan this code.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
+        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b> and use Leafy's scanner—not the regular Camera app.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
       </div> : <div className="sync-content scan-content">
         <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>The time-limited QR carries a pinned TLS certificate and a separate 256-bit encryption key. Your financial data remains end-to-end encrypted.</p>
         <button className="scan-button" onClick={scanCode} disabled={busy}><QrCode size={17}/>{busy ? 'Opening camera...' : 'Scan QR code'}</button>
@@ -432,7 +432,7 @@ export default function App() {
     <CurrencyContext.Provider value={currency}>
     <div className="app-shell">
       <aside>
-        <div className="brand"><img className="brand-mark" src={leafyIcon} alt="" /><div>Leafy<small>MONEY, SIMPLIFIED</small></div></div>
+        <div className="brand"><img className="brand-mark" src={leafyIcon} alt="" /><div>Leafy<small>Private ledger</small></div></div>
         <nav>
           <button className={activeSection === 'overview' && !syncOpen ? 'active' : ''} aria-current={activeSection === 'overview' && !syncOpen ? 'page' : undefined} onClick={() => scrollToSection('overview')}><LayoutDashboard size={19} />Overview</button>
           <button className={activeSection === 'transactions' && !syncOpen ? 'active' : ''} aria-current={activeSection === 'transactions' && !syncOpen ? 'page' : undefined} onClick={() => scrollToSection('transactions')}><ArrowLeftRight size={19} />Transactions</button>
@@ -454,20 +454,12 @@ export default function App() {
 
       <main>
         <header ref={overviewRef}>
-          <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting} <span>Let's check on your money.</span></h1></div>
+          <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting}<span>Your money, at a glance.</span></h1></div>
           <div className="header-actions">
-            <button className="icon-button notification-button" aria-label="Notifications"><Bell size={20} /></button>
             <button className="icon-button mobile-settings" onClick={() => setPreferencesOpen(true)} aria-label="Preferences"><Settings size={20} /></button>
-            <button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={19} />New transaction <kbd>N</kbd></button>
+            <button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={18} />Add transaction <kbd>N</kbd></button>
           </div>
         </header>
-
-        <section className="period-row">
-          <div className="periods">{[7, 30, 90].map(value => <button className={days === value ? 'active' : ''} aria-pressed={days === value} onClick={() => setDays(value)} key={value}>{value === 7 ? '7 days' : value === 30 ? 'This month' : '3 months'}</button>)}</div>
-          <button className="balance-toggle" aria-pressed={!showBalance} onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
-        </section>
-
-        <button className="mobile-add-button" onClick={() => setEntryOpen(true)}><Plus size={20} />New transaction</button>
 
         <section className="stats-grid">
           <StatCard label="Total balance" value={allSummary.balance} type="balance" note="Everything in minus everything out" hidden={!showBalance} />
@@ -475,28 +467,35 @@ export default function App() {
           <StatCard label="Expenses this period" value={summary.expenses} type="expense" note={`${periodRows.filter(t => t.type === 'expense').length} expenses recorded`} hidden={!showBalance} />
         </section>
 
+        <section className="period-row" aria-label="Dashboard controls">
+          <div className="periods">{[7, 30, 90].map(value => <button className={days === value ? 'active' : ''} aria-pressed={days === value} onClick={() => setDays(value)} key={value}>{value === 7 ? '7 days' : value === 30 ? 'This month' : '3 months'}</button>)}</div>
+          <button className="balance-toggle" aria-pressed={!showBalance} onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
+        </section>
+
+        <button className="mobile-add-button" onClick={() => setEntryOpen(true)} aria-label="Add transaction"><Plus size={21} /><span>Add</span></button>
+
         <section className="charts-grid dashboard-anchor" ref={insightsRef}>
           <article className="panel flow-panel">
-            <div className="panel-head"><div><span className="eyebrow">MONEY FLOW</span><h2>Income and expenses</h2></div><span className="legend"><i className="income-dot" />Income <i className="expense-dot" />Expenses</span></div>
+            <div className="panel-head"><div><span className="eyebrow">Cash flow</span><h2>Income and expenses</h2></div><span className="legend"><i className="income-dot" />Income <i className="expense-dot" />Expenses</span></div>
             <div className="chart-wrap">
               <ResponsiveContainer width="100%" height="100%"><AreaChart data={chart} margin={{ left: -18, right: 8, top: 12 }}>
-                <defs><linearGradient id="incomeFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#2b9c7b" stopOpacity={0.24}/><stop offset="1" stopColor="#2b9c7b" stopOpacity={0}/></linearGradient><linearGradient id="expenseFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#e26846" stopOpacity={0.18}/><stop offset="1" stopColor="#e26846" stopOpacity={0}/></linearGradient></defs>
-                <CartesianGrid vertical={false} stroke="#ebe8df" strokeDasharray="4 5" /><XAxis dataKey="date" tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} interval={Math.max(0, Math.floor(days / 6) - 1)} /><YAxis tickFormatter={v => money(v, true, currency)} tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip content={<CustomTooltip />} />
-                <Area type="monotone" dataKey="income" stroke="#5ed39f" strokeWidth={2.5} fill="url(#incomeFill)" dot={false} activeDot={{ r: 5, strokeWidth: 3, stroke: '#0f1d17' }} />
-                <Area type="monotone" dataKey="expenses" stroke="#e47b68" strokeWidth={2.5} fill="url(#expenseFill)" dot={false} activeDot={{ r: 5, strokeWidth: 3, stroke: '#0f1d17' }} />
+                <defs><linearGradient id="incomeFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#b8d96f" stopOpacity={0.16}/><stop offset="1" stopColor="#b8d96f" stopOpacity={0}/></linearGradient><linearGradient id="expenseFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#ef8a71" stopOpacity={0.14}/><stop offset="1" stopColor="#ef8a71" stopOpacity={0}/></linearGradient></defs>
+                <CartesianGrid vertical={false} stroke="#272b29" /><XAxis dataKey="date" tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} interval={Math.max(0, Math.floor(days / 6) - 1)} /><YAxis tickFormatter={v => money(v, true, currency)} tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip content={<CustomTooltip />} />
+                <Area type="monotone" dataKey="income" stroke="#b8d96f" strokeWidth={2.25} fill="url(#incomeFill)" dot={false} activeDot={{ r: 4, strokeWidth: 3, stroke: '#111412' }} />
+                <Area type="monotone" dataKey="expenses" stroke="#ef8a71" strokeWidth={2.25} fill="url(#expenseFill)" dot={false} activeDot={{ r: 4, strokeWidth: 3, stroke: '#111412' }} />
               </AreaChart></ResponsiveContainer>
             </div>
           </article>
 
           <article className="panel category-panel">
-            <div className="panel-head"><div><span className="eyebrow">WHERE IT WENT</span><h2>Expenses by category</h2></div><button className="icon-button" aria-label="More options"><MoreHorizontal size={20} /></button></div>
+            <div className="panel-head"><div><span className="eyebrow">Spending</span><h2>By category</h2></div></div>
             {categories.length ? <><div className="donut-wrap"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={categories} dataKey="value" innerRadius={58} outerRadius={81} paddingAngle={3} stroke="none">{categories.map(item => <Cell key={item.name} fill={COLORS[item.name] || COLORS.Other} />)}</Pie><Tooltip formatter={value => money(Number(value ?? 0), false, currency)} /></PieChart></ResponsiveContainer><div className="donut-center"><small>TOTAL</small><b>{money(summary.expenses, true, currency)}</b></div></div><div className="category-list">{categories.slice(0, 4).map(item => <div key={item.name}><span><i style={{ background: COLORS[item.name] || COLORS.Other }} />{item.name}</span><b>{summary.expenses ? ((item.value / summary.expenses) * 100).toFixed(0) : 0}%</b></div>)}</div></> : <div className="empty-chart">No expenses in this period</div>}
           </article>
         </section>
 
         <section className="lower-grid dashboard-anchor" ref={transactionsRef}>
           <article className="panel transactions-panel">
-            <div className="panel-head"><div><span className="eyebrow">TRANSACTIONS</span><h2>Most recent</h2></div><label className="search"><Search size={16} /><input aria-label="Search transactions" placeholder="Search" value={search} onChange={e => setSearch(e.target.value)} /></label></div>
+            <div className="panel-head"><div><span className="eyebrow">Activity</span><h2>Recent transactions</h2></div><label className="search"><Search size={16} /><input aria-label="Search transactions" placeholder="Search" value={search} onChange={e => setSearch(e.target.value)} /></label></div>
             <div className="transaction-list">{recent.map(row => <div className="transaction" key={row.id}>
               <span className={`transaction-icon ${row.type}`}>{row.type === 'income' ? <ArrowUpRight size={18} /> : <ReceiptText size={18} />}</span>
               <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}</span></div>
@@ -506,8 +505,8 @@ export default function App() {
           </article>
 
           <article className="panel rhythm-panel">
-            <div className="panel-head"><div><span className="eyebrow">SPENDING PACE</span><h2>Last 7 days</h2></div><span className="trend-badge">live</span></div>
-            <div className="bar-wrap"><ResponsiveContainer width="100%" height="100%"><BarChart data={dailySeries(lastDays(transactions, 7), 7)}><XAxis dataKey="date" tick={{ fill: '#7f9489', fontSize: 10 }} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip />} cursor={{ fill: '#172820' }} /><Bar dataKey="expenses" fill="#5ed39f" radius={[6, 6, 2, 2]} maxBarSize={25}/></BarChart></ResponsiveContainer></div>
+            <div className="panel-head"><div><span className="eyebrow">Spending pace</span><h2>Last 7 days</h2></div><span className="trend-badge">Daily</span></div>
+            <div className="bar-wrap"><ResponsiveContainer width="100%" height="100%"><BarChart data={dailySeries(lastDays(transactions, 7), 7)}><XAxis dataKey="date" tick={{ fill: '#777d79', fontSize: 10 }} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip />} cursor={{ fill: '#222724' }} /><Bar dataKey="expenses" fill="#ef8a71" radius={[3, 3, 0, 0]} maxBarSize={25}/></BarChart></ResponsiveContainer></div>
             <div className="daily-avg"><span>Daily average</span><b>{money(weekSpend / 7, false, currency)}</b></div>
           </article>
         </section>
