@@ -15,7 +15,8 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tauri::State;
+use tauri::{AppHandle, State};
+use tauri_plugin_opener::OpenerExt;
 use tokio::sync::RwLock;
 
 const MAX_SYNC_BYTES: usize = 5_000_000;
@@ -72,6 +73,98 @@ struct ChatChoice {
 #[derive(Deserialize)]
 struct ChatAnswer {
     content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    html_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck {
+    current_version: String,
+    latest_version: String,
+    available: bool,
+    release_url: String,
+}
+
+fn version_parts(version: &str) -> Option<[u64; 3]> {
+    let core = version.trim().trim_start_matches('v').split('-').next()?;
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    let parsed = [
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    ];
+    parts.next().is_none().then_some(parsed)
+}
+
+#[tauri::command]
+async fn check_for_updates() -> Result<UpdateCheck, String> {
+    const MAX_RELEASE_BYTES: usize = 64 * 1024;
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let response = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Could not prepare the update check")?
+        .get("https://api.github.com/repos/MusicMaster4/Leafy/releases/latest")
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Leafy update checker")
+        .send()
+        .await
+        .map_err(|_| "Could not reach GitHub Releases")?;
+    if !response.status().is_success() {
+        return Err(format!("GitHub Releases returned {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RELEASE_BYTES as u64)
+    {
+        return Err("GitHub Releases returned an oversized response".into());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "Could not read the latest release")?;
+    if bytes.len() > MAX_RELEASE_BYTES {
+        return Err("GitHub Releases returned an oversized response".into());
+    }
+    let release: GithubRelease = serde_json::from_slice(&bytes)
+        .map_err(|_| "GitHub Releases returned an invalid response")?;
+    let current = version_parts(&current_version).ok_or("The current app version is invalid")?;
+    let latest = version_parts(&release.tag_name).ok_or("The latest release version is invalid")?;
+    Ok(UpdateCheck {
+        current_version,
+        latest_version: release.tag_name.trim_start_matches('v').to_string(),
+        available: latest > current,
+        release_url: release.html_url,
+    })
+}
+
+#[tauri::command]
+fn open_release(release_url: String, app: AppHandle) -> Result<(), String> {
+    let url = reqwest::Url::parse(&release_url).map_err(|_| "Invalid release URL")?;
+    if !trusted_release_url(&url) {
+        return Err("Untrusted release URL".into());
+    }
+    app.opener()
+        .open_url(url.as_str(), None::<String>)
+        .map_err(|_| "Could not open GitHub Releases".into())
+}
+
+fn trusted_release_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.port().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && url.path().starts_with("/MusicMaster4/Leafy/releases/")
 }
 
 #[tauri::command]
@@ -426,7 +519,7 @@ fn take_sync_update(state: State<'_, AppState>) -> Result<Option<String>, String
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     ensure_crypto_provider();
-    let builder = tauri::Builder::default();
+    let builder = tauri::Builder::default().plugin(tauri_plugin_opener::init());
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     builder
@@ -437,7 +530,9 @@ pub fn run() {
             start_pairing_server,
             sync_download,
             sync_upload,
-            take_sync_update
+            take_sync_update,
+            check_for_updates,
+            open_release
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Leafy");
@@ -446,6 +541,29 @@ pub fn run() {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn parses_release_versions_for_update_comparison() {
+        assert_eq!(version_parts("v1.12.3"), Some([1, 12, 3]));
+        assert_eq!(version_parts("0.2.0-beta.4"), Some([0, 2, 0]));
+        assert_eq!(version_parts("1.2"), None);
+        assert!(version_parts("1.10.0").unwrap() > version_parts("1.9.9").unwrap());
+    }
+
+    #[test]
+    fn opens_only_official_leafy_release_pages() {
+        let valid =
+            reqwest::Url::parse("https://github.com/MusicMaster4/Leafy/releases/tag/v0.1.5")
+                .unwrap();
+        let lookalike =
+            reqwest::Url::parse("https://github.com.evil.test/MusicMaster4/Leafy/releases/tag/v9")
+                .unwrap();
+        let wrong_repo =
+            reqwest::Url::parse("https://github.com/other/Leafy/releases/tag/v9").unwrap();
+        assert!(trusted_release_url(&valid));
+        assert!(!trusted_release_url(&lookalike));
+        assert!(!trusted_release_url(&wrong_repo));
+    }
 
     #[test]
     fn accepts_only_well_formed_ciphertext() {

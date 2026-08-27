@@ -26,6 +26,7 @@ import {
   createPairing, forgetPeer, mergeTransactions, parsePairing, pullFromPeer, pushToPeer,
   rememberPeer, savedPeer, scanPairingCode, serializePairing, type PairingDetails,
 } from './sync'
+import { checkForUpdates, openRelease, type UpdateCheck } from './updates'
 
 const COLORS: Record<string, string> = {
   Food: '#d9a441', Housing: '#718bdb', Transport: '#51a98e', Leisure: '#d86f91',
@@ -283,7 +284,11 @@ export default function App() {
   const [peer, setPeer] = useState<PairingDetails | null>(null)
   const [search, setSearch] = useState('')
   const [toast, setToast] = useState('')
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false)
+  const [checkingUpdates, setCheckingUpdates] = useState(false)
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null)
   const [activeSection, setActiveSection] = useState<DashboardSection>('overview')
+  const profileMenuRef = useRef<HTMLDivElement>(null)
   const overviewRef = useRef<HTMLElement>(null)
   const transactionsRef = useRef<HTMLElement>(null)
   const insightsRef = useRef<HTMLElement>(null)
@@ -334,11 +339,20 @@ export default function App() {
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) setEntryOpen(true)
-      if (event.key === 'Escape') setEntryOpen(false)
+      if (event.key === 'Escape') { setEntryOpen(false); setProfileMenuOpen(false) }
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
   }, [])
+
+  useEffect(() => {
+    if (!profileMenuOpen) return
+    const close = (event: PointerEvent) => {
+      if (!profileMenuRef.current?.contains(event.target as Node)) setProfileMenuOpen(false)
+    }
+    window.addEventListener('pointerdown', close)
+    return () => window.removeEventListener('pointerdown', close)
+  }, [profileMenuOpen])
 
   useEffect(() => {
     if (storageError) setToast('Private storage could not be unlocked. Changes will not be saved.')
@@ -397,6 +411,23 @@ export default function App() {
     ? setToast('Unlock private storage before changing transactions.')
     : setTransactions(current => current.filter(t => t.id !== id))
 
+  const checkUpdates = async () => {
+    setCheckingUpdates(true)
+    try {
+      const update = await checkForUpdates()
+      if (update.available) {
+        setAvailableUpdate(update)
+        setToast('')
+      } else setToast(`Leafy ${update.currentVersion} is up to date`)
+    } catch {
+      setToast('Could not check for updates. Try again in a moment.')
+    } finally {
+      setCheckingUpdates(false)
+      setProfileMenuOpen(false)
+      window.setTimeout(() => setToast(''), 4200)
+    }
+  }
+
   return (
     <CurrencyContext.Provider value={currency}>
     <div className="app-shell">
@@ -411,20 +442,32 @@ export default function App() {
         <div className="side-bottom">
           <div className="weekly-card"><span className="mini-icon"><TrendingUp size={16} /></span><div><small>Spent in 7 days</small><b>{money(weekSpend, false, currency)}</b></div></div>
           <button className="settings" onClick={() => setPreferencesOpen(true)}><Settings size={18} />Preferences</button>
-          <div className="profile"><span>M</span><div><b>My money</b><small>Local data</small></div><MoreHorizontal size={18} /></div>
+          <div className="profile" ref={profileMenuRef}>
+            <span>M</span><div><b>My money</b><small>Local data</small></div>
+            <button type="button" className="profile-menu-trigger" aria-label="Account options" aria-haspopup="menu" aria-expanded={profileMenuOpen} onClick={() => setProfileMenuOpen(open => !open)}><MoreHorizontal size={18} /></button>
+            {profileMenuOpen && <div className="profile-menu" role="menu">
+              <button type="button" role="menuitem" onClick={checkUpdates} disabled={checkingUpdates}><RefreshCw size={15} className={checkingUpdates ? 'spinning' : ''}/>{checkingUpdates ? 'Checking...' : 'Check for updates'}</button>
+            </div>}
+          </div>
         </div>
       </aside>
 
       <main>
         <header ref={overviewRef}>
           <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting} <span>Let's check on your money.</span></h1></div>
-          <div className="header-actions"><button className="icon-button" aria-label="Notifications"><Bell size={20} /></button><button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={19} />New transaction <kbd>N</kbd></button></div>
+          <div className="header-actions">
+            <button className="icon-button notification-button" aria-label="Notifications"><Bell size={20} /></button>
+            <button className="icon-button mobile-settings" onClick={() => setPreferencesOpen(true)} aria-label="Preferences"><Settings size={20} /></button>
+            <button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={19} />New transaction <kbd>N</kbd></button>
+          </div>
         </header>
 
         <section className="period-row">
-          <div className="periods">{[7, 30, 90].map(value => <button className={days === value ? 'active' : ''} onClick={() => setDays(value)} key={value}>{value === 7 ? '7 days' : value === 30 ? 'This month' : '3 months'}</button>)}</div>
-          <button className="balance-toggle" onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
+          <div className="periods">{[7, 30, 90].map(value => <button className={days === value ? 'active' : ''} aria-pressed={days === value} onClick={() => setDays(value)} key={value}>{value === 7 ? '7 days' : value === 30 ? 'This month' : '3 months'}</button>)}</div>
+          <button className="balance-toggle" aria-pressed={!showBalance} onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
         </section>
+
+        <button className="mobile-add-button" onClick={() => setEntryOpen(true)}><Plus size={20} />New transaction</button>
 
         <section className="stats-grid">
           <StatCard label="Total balance" value={allSummary.balance} type="balance" note="Everything in minus everything out" hidden={!showBalance} />
@@ -470,7 +513,6 @@ export default function App() {
         </section>
       </main>
 
-      <button className="mobile-fab" onClick={() => setEntryOpen(true)}><Plus size={23} /></button>
       {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} />}
       {preferencesOpen && <PreferencesPanel currency={currency} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
       {syncOpen && <SyncPanel transactions={transactions} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onMerge={rows => setTransactions(current => mergeTransactions(current, rows))} />}
@@ -481,6 +523,12 @@ export default function App() {
           setSharedReceipt(null)
         }}/>
       )}
+      {availableUpdate && <div className="update-notice" role="status">
+        <span className="update-notice-icon"><RefreshCw size={17}/></span>
+        <div><b>Update available</b><span>Leafy {availableUpdate.latestVersion} is ready to download.</span></div>
+        <button type="button" className="view-release-button" onClick={() => void openRelease(availableUpdate.releaseUrl).catch(() => setToast('Could not open GitHub Releases.'))}>View release</button>
+        <button type="button" className="dismiss-update" aria-label="Dismiss update notice" onClick={() => setAvailableUpdate(null)}><X size={16}/></button>
+      </div>}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </div>
     </CurrencyContext.Provider>
