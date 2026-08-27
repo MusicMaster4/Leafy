@@ -93,7 +93,7 @@ jobs:
           - platform: ubuntu-22.04
             args: --bundles deb,appimage
           - platform: macos-latest
-            args: --bundles dmg
+            args: --bundles app,dmg
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
@@ -123,6 +123,7 @@ jobs:
           releaseName: Leafy ${{ needs.version.outputs.tag }}
           releaseDraft: true
           prerelease: ${{ needs.version.outputs.channel == 'testing' }}
+          retryAttempts: 3
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
 
