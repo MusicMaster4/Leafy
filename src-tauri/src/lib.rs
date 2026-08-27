@@ -44,7 +44,7 @@ pub extern "C" fn init_android_tls_verifier<'local>(
 #[derive(Default)]
 struct AppState {
     openrouter_key: Arc<Mutex<Option<String>>>,
-    received_sync: Arc<Mutex<Option<String>>>,
+    hosted_sync: Arc<Mutex<Option<Arc<RwLock<String>>>>>,
 }
 
 #[derive(Clone)]
@@ -52,7 +52,6 @@ struct SyncServerState {
     token: [u8; 32],
     expires_at: Instant,
     payload: Arc<RwLock<String>>,
-    received: Arc<Mutex<Option<String>>>,
     openrouter_key: Arc<Mutex<Option<String>>>,
 }
 
@@ -516,33 +515,6 @@ async fn download_sync(
         .unwrap()
 }
 
-async fn upload_sync(
-    AxumState(state): AxumState<SyncServerState>,
-    headers: HeaderMap,
-    body: String,
-) -> Response<Body> {
-    if !is_authorized(&headers, &state) {
-        return Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .body(Body::empty())
-            .unwrap();
-    }
-    if !valid_ciphertext(&body) {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::empty())
-            .unwrap();
-    }
-    *state.payload.write().await = body.clone();
-    if let Ok(mut received) = state.received.lock() {
-        *received = Some(body);
-    }
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(Body::empty())
-        .unwrap()
-}
-
 async fn categorize_for_peer(
     AxumState(state): AxumState<SyncServerState>,
     headers: HeaderMap,
@@ -652,15 +624,19 @@ async fn start_pairing_server(
     let tls = RustlsConfig::from_der(vec![certificate.clone()], signing_key.serialize_der())
         .await
         .map_err(|error| format!("Could not configure private TLS: {error}"))?;
+    let hosted_payload = Arc::new(RwLock::new(payload));
+    *state
+        .hosted_sync
+        .lock()
+        .map_err(|_| "Could not prepare the mirrored ledger")? = Some(hosted_payload.clone());
     let server_state = SyncServerState {
         token,
         expires_at: Instant::now() + Duration::from_secs(SYNC_SESSION_SECONDS),
-        payload: Arc::new(RwLock::new(payload)),
-        received: state.received_sync.clone(),
+        payload: hosted_payload,
         openrouter_key: state.openrouter_key.clone(),
     };
     let app = Router::new()
-        .route("/sync", get(download_sync).put(upload_sync))
+        .route("/sync", get(download_sync))
         .route("/categorize", post(categorize_for_peer))
         .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
         .with_state(server_state);
@@ -732,9 +708,14 @@ fn private_sync_client(certificate: &str) -> Result<reqwest::Client, String> {
     let certificate =
         reqwest::Certificate::from_der(&der).map_err(|_| "Invalid pairing certificate")?;
     reqwest::Client::builder()
-        .add_root_certificate(certificate)
+        // `add_root_certificate` asks reqwest's Android platform verifier to
+        // merge an extra root, a configuration it does not support. An
+        // exclusive store both fixes Android's builder error and makes the QR
+        // certificate a real pin instead of an additional trusted root.
+        .tls_certs_only([certificate])
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .build()
@@ -775,30 +756,18 @@ async fn sync_download(
 }
 
 #[tauri::command]
-async fn sync_upload(
-    endpoint: String,
-    certificate: String,
-    token: String,
-    payload: String,
-) -> Result<(), String> {
-    let url = private_sync_url(&endpoint)?;
-    decode_token(&token)?;
+async fn publish_sync_snapshot(payload: String, state: State<'_, AppState>) -> Result<(), String> {
     if !valid_ciphertext(&payload) {
         return Err("Invalid encrypted sync payload".into());
     }
-    let response = private_sync_client(&certificate)?
-        .put(url)
-        .bearer_auth(token)
-        .header("content-type", "application/octet-stream")
-        .body(payload)
-        .send()
-        .await
-        .map_err(|error| format!("Private sync failed: {error}"))?;
-    response
-        .status()
-        .is_success()
-        .then_some(())
-        .ok_or_else(|| format!("Private sync returned {}", response.status()))
+    let hosted = state
+        .hosted_sync
+        .lock()
+        .map_err(|_| "Could not access the mirrored ledger")?
+        .clone()
+        .ok_or("Create a pairing code before publishing the mirrored ledger")?;
+    *hosted.write().await = payload;
+    Ok(())
 }
 
 #[tauri::command]
@@ -838,15 +807,6 @@ async fn categorize_via_peer(
         .map_err(|_| "Your computer returned an invalid category".into())
 }
 
-#[tauri::command]
-fn take_sync_update(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    Ok(state
-        .received_sync
-        .lock()
-        .map_err(|_| "Could not access sync updates")?
-        .take())
-}
-
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     ensure_crypto_provider();
@@ -870,9 +830,8 @@ pub fn run() {
             categorize_transaction,
             start_pairing_server,
             sync_download,
-            sync_upload,
+            publish_sync_snapshot,
             categorize_via_peer,
-            take_sync_update,
             check_for_updates,
             #[cfg(desktop)]
             install_desktop_update
@@ -993,17 +952,17 @@ mod security_tests {
         let tls = RustlsConfig::from_der(vec![certificate.clone()], signing_key.serialize_der())
             .await
             .unwrap();
+        let mirrored_payload = Arc::new(RwLock::new(
+            "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA".into(),
+        ));
         let state = SyncServerState {
             token: [7_u8; 32],
             expires_at: Instant::now() + Duration::from_secs(30),
-            payload: Arc::new(RwLock::new(
-                "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA".into(),
-            )),
-            received: Arc::new(Mutex::new(None)),
+            payload: mirrored_payload.clone(),
             openrouter_key: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
-            .route("/sync", get(download_sync).put(upload_sync))
+            .route("/sync", get(download_sync))
             .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
             .with_state(state);
         let server = axum_server::from_tcp_rustls(listener, tls).unwrap();
@@ -1020,6 +979,29 @@ mod security_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+
+        *mirrored_payload.write().await = "BBBBBBBBBBBBBBBB.BBBBBBBBBBBBBBBBBBBBBB".into();
+        let refreshed = private_sync_client(&pinned)
+            .unwrap()
+            .get(&endpoint)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.text().await.unwrap(),
+            "BBBBBBBBBBBBBBBB.BBBBBBBBBBBBBBBBBBBBBB"
+        );
+
+        let upload = private_sync_client(&pinned)
+            .unwrap()
+            .put(&endpoint)
+            .bearer_auth(&token)
+            .body("AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::METHOD_NOT_ALLOWED);
 
         let other = generate_simple_self_signed(vec![address.to_string()]).unwrap();
         let wrong_pin = URL_SAFE_NO_PAD.encode(other.cert.der());
