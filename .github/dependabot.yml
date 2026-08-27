@@ -18,6 +18,15 @@ updates:
     directory: /src-tauri/gen/android
     schedule:
       interval: weekly
+    ignore:
+      # Tauri's generated Android BuildTask still relies on Project.exec,
+      # which was removed in Gradle 9.
+      - dependency-name: gradle-wrapper
+        versions: [">= 9"]
+      # Tauri 2.11 still ships a legacy kotlinOptions block that Kotlin 2.3+
+      # treats as a build error. Kotlin 2.2.21 is the newest compatible line.
+      - dependency-name: org.jetbrains.kotlin:kotlin-gradle-plugin
+        versions: [">= 2.3"]
     groups:
       android-dependencies:
         patterns: ["*"]
