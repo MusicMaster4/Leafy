@@ -21,6 +21,17 @@ export type Transaction = {
   description: string
   category: string
   date: string
+  recurringExpenseId?: string
+}
+
+export type RecurringExpense = {
+  id: string
+  amount: number
+  description: string
+  category: string
+  dayOfMonth: number
+  startDate: string
+  lastGeneratedDate?: string
 }
 
 export const expenseCategories = ['Food', 'Housing', 'Transport', 'Leisure', 'Health', 'Shopping', 'Subscriptions', 'Other']

@@ -31,6 +31,7 @@ function isTransaction(value: unknown): value is Transaction {
     && typeof row.description === 'string' && row.description.length > 0 && row.description.length <= 200
     && typeof row.category === 'string' && row.category.length > 0 && row.category.length <= 50
     && typeof row.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(row.date) && !Number.isNaN(Date.parse(`${row.date}T00:00:00Z`))
+    && (row.recurringExpenseId === undefined || (typeof row.recurringExpenseId === 'string' && row.recurringExpenseId.length > 0 && row.recurringExpenseId.length <= 128))
 }
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')

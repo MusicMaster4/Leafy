@@ -1,7 +1,7 @@
 import { createContext, FormEvent, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ArrowDownRight, ArrowLeftRight, ArrowUpRight, ChevronDown, CircleDollarSign,
-  AlertTriangle, Eye, EyeOff, FileCheck2, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
+  AlertTriangle, CalendarClock, Eye, EyeOff, FileCheck2, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
   ReceiptText, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Trash2, TrendingUp, Unplug,
   WalletCards, WandSparkles, X,
 } from 'lucide-react'
@@ -16,7 +16,7 @@ import { categorySeries, dailySeries, lastDays, money, parseAmount, summarize } 
 import { demoTransactions } from './data'
 import {
   currencies, currencyDetails, expenseCategories, incomeCategories, isCurrencyCode,
-  type CurrencyCode, type Transaction, type TransactionType,
+  type CurrencyCode, type RecurringExpense, type Transaction, type TransactionType,
 } from './types'
 import { categorizeWithAi, configureOpenRouter, localCategory, restoreOpenRouter } from './ai'
 import leafyIcon from '../src-tauri/icons/app-icon.svg'
@@ -28,6 +28,7 @@ import {
 } from './sync'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { canInstallAndroidUpdate, checkForUpdates, installAndroidUpdate, installDesktopUpdate, type UpdateCheck } from './updates'
+import { materializeRecurringExpenses, nextMonthlyOccurrence, nextRecurringDueDate } from './recurring'
 
 const COLORS: Record<string, string> = {
   Food: '#d9a441', Housing: '#718bdb', Transport: '#51a98e', Leisure: '#d86f91',
@@ -73,6 +74,22 @@ function useTransactions() {
   return [transactions, setTransactions, ready, storageError] as const
 }
 
+function useRecurringExpenses() {
+  const [recurringExpenses, setRecurringExpenses] = useState<RecurringExpense[]>([])
+  const [ready, setReady] = useState(false)
+  const [storageError, setStorageError] = useState(false)
+  useEffect(() => {
+    void secureGet<RecurringExpense[]>('recurring-expenses')
+      .then(rows => setRecurringExpenses(Array.isArray(rows) ? rows : []))
+      .catch(() => setStorageError(true))
+      .finally(() => setReady(true))
+  }, [])
+  useEffect(() => {
+    if (ready && !storageError) void secureSet('recurring-expenses', recurringExpenses).catch(() => setStorageError(true))
+  }, [ready, recurringExpenses, storageError])
+  return [recurringExpenses, setRecurringExpenses, ready, storageError] as const
+}
+
 function StatCard({ label, value, type, note, hidden }: { label: string; value: number; type: 'balance' | 'income' | 'expense'; note: string; hidden?: boolean }) {
   const Icon = type === 'income' ? ArrowUpRight : type === 'expense' ? ArrowDownRight : WalletCards
   const currency = useCurrency()
@@ -91,15 +108,22 @@ function CustomTooltip({ active, payload, label }: any) {
   return <div className="chart-tooltip"><b>{label}</b>{payload.map((p: any) => <span key={p.name} style={{ color: p.color }}>{p.name}: {money(p.value, false, currency)}</span>)}</div>
 }
 
-function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: Transaction, useAi: boolean) => void }) {
+function AddTransaction({ onClose, onAdd, onSchedule }: {
+  onClose: () => void
+  onAdd: (row: Transaction, useAi: boolean) => void
+  onSchedule: (rule: RecurringExpense, useAi: boolean) => void
+}) {
   const currency = useCurrency()
   const [type, setType] = useState<TransactionType>('expense')
   const [amount, setAmount] = useState('')
   const [description, setDescription] = useState('')
+  const [recurring, setRecurring] = useState(false)
+  const [dayOfMonth, setDayOfMonth] = useState(String(new Date().getDate()))
   const categories = type === 'expense' ? expenseCategories : incomeCategories
   const [category, setCategory] = useState('Auto')
 
   useEffect(() => setCategory('Auto'), [type])
+  useEffect(() => { if (type === 'income') setRecurring(false) }, [type])
   useEffect(() => document.querySelector<HTMLInputElement>('#amount')?.focus(), [])
 
   const submit = (event: FormEvent) => {
@@ -108,6 +132,19 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
     if (!value || value <= 0) return
     const automatic = category === 'Auto'
     const label = description.trim() || (type === 'expense' ? 'Expense' : 'Income')
+    if (recurring && type === 'expense') {
+      const chargeDay = Number(dayOfMonth)
+      if (!Number.isInteger(chargeDay) || chargeDay < 1 || chargeDay > 31) return
+      onSchedule({
+        id: crypto.randomUUID(),
+        amount: value,
+        description: label,
+        category: automatic ? 'Other' : category,
+        dayOfMonth: chargeDay,
+        startDate: nextMonthlyOccurrence(chargeDay),
+      }, automatic)
+      return
+    }
     onAdd({ id: crypto.randomUUID(), type, amount: value, description: label, category: automatic ? 'Other' : category, date: format(new Date(), 'yyyy-MM-dd') }, automatic)
   }
 
@@ -124,8 +161,17 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
         </div>
         <label className="amount-field"><span>Amount</span><div><b>{currencyDetails(currency).symbol}</b><input id="amount" inputMode="decimal" maxLength={24} placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} /></div></label>
         <label className="input-label"><span>Description <i>optional</i></span><input maxLength={200} placeholder={type === 'expense' ? 'Example: lunch, groceries...' : 'Example: salary, freelance...'} value={description} onChange={e => setDescription(e.target.value)} /></label>
+        {type === 'expense' && <div className="recurring-field">
+          <button type="button" className={recurring ? 'recurring-toggle active' : 'recurring-toggle'} aria-pressed={recurring} onClick={() => setRecurring(value => !value)}>
+            <CalendarClock size={19}/><span><b>Repeat monthly</b><small>Schedule this expense automatically</small></span><i aria-hidden="true"/>
+          </button>
+          {recurring && <div className="recurring-options">
+            <label className="input-label"><span>Charge day</span><input type="number" inputMode="numeric" min="1" max="31" required value={dayOfMonth} onChange={event => setDayOfMonth(event.target.value)}/></label>
+            {Number(dayOfMonth) >= 1 && Number(dayOfMonth) <= 31 && <p>Next charge: <b>{format(parseISO(nextMonthlyOccurrence(Number(dayOfMonth))), 'MMMM d, yyyy', { locale: enUS })}</b>. Shorter months use their final day.</p>}
+          </div>}
+        </div>}
         <div className="category-field"><span>Category</span><div className="category-chips"><button type="button" className={category === 'Auto' ? 'active auto' : ''} onClick={() => setCategory('Auto')}><WandSparkles size={12} /> Auto</button>{categories.map(item => <button type="button" className={category === item ? 'active' : ''} onClick={() => setCategory(item)} key={item}>{item}</button>)}</div>{category === 'Auto' && <small className="auto-hint">Leafy will categorize it with AI. Local matching is used when offline.</small>}</div>
-        <button className={`save-button ${type}`} type="submit">Save {type === 'expense' ? 'expense' : 'income'} <span>↵</span></button>
+        <button className={`save-button ${type}`} type="submit">{recurring ? 'Schedule monthly expense' : `Save ${type === 'expense' ? 'expense' : 'income'}`} <span>↵</span></button>
         <p className="privacy-note">Stored only on this device</p>
       </form>
     </div>
@@ -302,6 +348,7 @@ function nextConnectionHint(details: PairingDetails | undefined, pairingText: st
 
 export default function App() {
   const [transactions, setTransactions, storageReady, storageError] = useTransactions()
+  const [recurringExpenses, setRecurringExpenses, recurringReady, recurringStorageError] = useRecurringExpenses()
   const [days, setDays] = useState(30)
   const [showBalance, setShowBalance] = useState(true)
   const [preferencesReady, setPreferencesReady] = useState(false)
@@ -320,6 +367,7 @@ export default function App() {
   const [installingUpdate, setInstallingUpdate] = useState(false)
   const [updateProgress, setUpdateProgress] = useState(0)
   const [activeSection, setActiveSection] = useState<DashboardSection>('overview')
+  const [todayKey, setTodayKey] = useState(() => format(new Date(), 'yyyy-MM-dd'))
   const profileMenuRef = useRef<HTMLDivElement>(null)
   const overviewRef = useRef<HTMLElement>(null)
   const transactionsRef = useRef<HTMLElement>(null)
@@ -334,6 +382,7 @@ export default function App() {
   const recent = transactions
     .filter(t => `${t.description} ${t.category}`.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7)
+  const recurringSorted = [...recurringExpenses].sort((a, b) => nextRecurringDueDate(a).localeCompare(nextRecurringDueDate(b)))
 
   const scrollToSection = (section: DashboardSection) => {
     setActiveSection(section)
@@ -441,8 +490,28 @@ export default function App() {
   }, [profileMenuOpen])
 
   useEffect(() => {
-    if (storageError) setToast('Private storage could not be unlocked. Changes will not be saved.')
-  }, [storageError])
+    if (storageError || recurringStorageError) setToast('Private storage could not be unlocked. Changes will not be saved.')
+  }, [recurringStorageError, storageError])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTodayKey(format(new Date(), 'yyyy-MM-dd')), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!storageReady || !recurringReady || storageError || recurringStorageError) return
+    const result = materializeRecurringExpenses(recurringExpenses, transactions, parseISO(todayKey))
+    if (result.transactions.length) {
+      setTransactions(current => {
+        const currentIds = new Set(current.map(row => row.id))
+        const due = result.transactions.filter(row => !currentIds.has(row.id))
+        return due.length ? [...due, ...current] : current
+      })
+      setToast(result.transactions.length === 1 ? 'Recurring expense added' : `${result.transactions.length} recurring expenses added`)
+      window.setTimeout(() => setToast(''), 3200)
+    }
+    if (result.rules !== recurringExpenses) setRecurringExpenses(result.rules)
+  }, [recurringExpenses, recurringReady, recurringStorageError, setRecurringExpenses, setTransactions, storageError, storageReady, todayKey])
 
   useEffect(() => {
     void savedPeer().then(setPeer)
@@ -493,9 +562,27 @@ export default function App() {
       window.setTimeout(() => setToast(''), 2600)
     }
   }
+  const scheduleRecurring = async (rule: RecurringExpense, useAi: boolean) => {
+    if (storageError || recurringStorageError) {
+      setToast('Unlock private storage before scheduling recurring expenses.')
+      return
+    }
+    setRecurringExpenses(current => [rule, ...current])
+    setEntryOpen(false)
+    setToast(`Scheduled monthly for day ${rule.dayOfMonth}`)
+    window.setTimeout(() => setToast(''), 3000)
+    if (useAi) {
+      const category = await categorizeWithAi(rule.description, 'expense', peer)
+      setRecurringExpenses(current => current.map(item => item.id === rule.id ? { ...item, category } : item))
+      setTransactions(current => current.map(item => item.recurringExpenseId === rule.id ? { ...item, category } : item))
+    }
+  }
   const remove = (id: string) => storageError
     ? setToast('Unlock private storage before changing transactions.')
     : setTransactions(current => current.filter(t => t.id !== id))
+  const removeRecurring = (id: string) => recurringStorageError
+    ? setToast('Unlock private storage before changing recurring expenses.')
+    : setRecurringExpenses(current => current.filter(rule => rule.id !== id))
 
   const checkUpdates = async () => {
     setCheckingUpdates(true)
@@ -602,7 +689,7 @@ export default function App() {
             <div className="panel-head"><div><span className="eyebrow">Activity</span><h2>Recent transactions</h2></div><label className="search"><Search size={16} /><input aria-label="Search transactions" placeholder="Search" value={search} onChange={e => setSearch(e.target.value)} /></label></div>
             <div className="transaction-list">{recent.map(row => <div className="transaction" key={row.id}>
               <span className={`transaction-icon ${row.type}`}>{row.type === 'income' ? <ArrowUpRight size={18} /> : <ReceiptText size={18} />}</span>
-              <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}</span></div>
+              <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}{row.recurringExpenseId ? ' · Recurring' : ''}</span></div>
               <strong className={row.type}>{row.type === 'income' ? '+' : '−'} {money(row.amount, false, currency)}</strong>
               <button className="delete-button" onClick={() => remove(row.id)} aria-label={`Delete ${row.description}`}><Trash2 size={16} /></button>
             </div>)}</div>
@@ -613,10 +700,20 @@ export default function App() {
             <div className="bar-wrap"><ResponsiveContainer width="100%" height="100%"><BarChart data={dailySeries(lastDays(transactions, 7), 7)}><XAxis dataKey="date" tick={{ fill: '#777d79', fontSize: 10 }} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip />} cursor={{ fill: '#222724' }} /><Bar dataKey="expenses" fill="#ef8a71" radius={[3, 3, 0, 0]} maxBarSize={25}/></BarChart></ResponsiveContainer></div>
             <div className="daily-avg"><span>Daily average</span><b>{money(weekSpend / 7, false, currency)}</b></div>
           </article>
+
+          {recurringSorted.length > 0 && <article className="panel recurring-panel">
+            <div className="panel-head"><div><span className="eyebrow">Automatic expenses</span><h2>Recurring monthly</h2></div><span className="trend-badge">{recurringSorted.length} active</span></div>
+            <div className="recurring-list">{recurringSorted.map(rule => <div className="recurring-row" key={rule.id}>
+              <span className="recurring-icon"><CalendarClock size={18}/></span>
+              <div><b>{rule.description}</b><span>Day {rule.dayOfMonth} · Next {format(parseISO(nextRecurringDueDate(rule)), 'MMM d', { locale: enUS })}</span></div>
+              <strong>{money(rule.amount, false, currency)}</strong>
+              <button className="delete-button" onClick={() => removeRecurring(rule.id)} aria-label={`Cancel recurring expense ${rule.description}`}><Trash2 size={16}/></button>
+            </div>)}</div>
+          </article>}
         </section>
       </main>
 
-      {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} />}
+      {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} onSchedule={scheduleRecurring} />}
       {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
       {syncOpen && <SyncPanel transactions={transactions} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onMerge={rows => setTransactions(current => mergeTransactions(current, rows))} />}
       {sharedReceipt && (

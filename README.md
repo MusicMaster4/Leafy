@@ -19,6 +19,7 @@ There is no Leafy account or hosted ledger. Transactions and preferences stay on
 ## What Leafy can do
 
 - Record income and expenses quickly, with the `N` desktop shortcut
+- Schedule monthly recurring expenses for automatic entry on a chosen day
 - Show balance, cash flow, savings rate, categories, and seven-day spending pace
 - Switch between 7, 30, and 90-day views
 - Display BRL, USD, EUR, or GBP without pretending to convert historical values

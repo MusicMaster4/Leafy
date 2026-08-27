@@ -13,6 +13,7 @@ const rows: Transaction[] = [{
   description: 'Fictional lunch',
   category: 'Food',
   date: '2026-08-27',
+  recurringExpenseId: 'fictional-recurring-rule',
 }]
 
 describe('private sync envelope', () => {
