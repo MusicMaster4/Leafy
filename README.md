@@ -1,10 +1,11 @@
 <div align="center">
-  <img src="src-tauri/icons/128x128.png" width="92" alt="Leafy icon" />
+  <img src="src-tauri/icons/app-icon.svg" width="92" alt="Leafy icon" />
   <h1>Leafy</h1>
   <p>A calm, local-first way to understand your money.</p>
 
   [![CI](https://github.com/MusicMaster4/Leafy/actions/workflows/ci.yml/badge.svg)](https://github.com/MusicMaster4/Leafy/actions/workflows/ci.yml)
   [![Release](https://github.com/MusicMaster4/Leafy/actions/workflows/release.yml/badge.svg)](https://github.com/MusicMaster4/Leafy/releases)
+  [![Security](https://github.com/MusicMaster4/Leafy/actions/workflows/security.yml/badge.svg)](https://github.com/MusicMaster4/Leafy/actions/workflows/security.yml)
   ![Tauri 2](https://img.shields.io/badge/Tauri-2-24C8DB?logo=tauri&logoColor=white)
   ![React 19](https://img.shields.io/badge/React-19-149ECA?logo=react&logoColor=white)
 </div>
@@ -13,7 +14,7 @@
 
 Leafy is a personal finance tracker for people who stop using finance trackers. Adding an expense takes a value, a short description, and one click. The dashboard does the rest.
 
-Your ledger lives on your device. There is no Leafy account and no shared database. Pairing a phone with a computer uses a QR code, a local network connection, and AES-256-GCM encryption.
+Your ledger lives on your device. There is no Leafy account and no shared database. Local records are sealed with AES-256-GCM, while phone-to-computer sync combines end-to-end encryption with a short-lived, certificate-pinned TLS session.
 
 ## What works today
 
@@ -74,12 +75,13 @@ The key is not written to the repository, paired to another device, or included 
 
 ## Private device sync
 
-The desktop app starts an HTTP endpoint on a random port in your local network. HTTP is used only as a transport for ciphertext. The QR code carries two random values:
+The desktop app starts a one-hour HTTPS endpoint on a random port in your local network. Its self-signed certificate is pinned directly from the QR code, so Leafy never disables certificate or hostname verification. The QR carries independent secrets for transport authentication and content encryption:
 
-- a 256-bit AES-GCM key used in the webview before any financial data leaves it
-- a separate 256-bit bearer token used to reject unknown devices
+- a 256-bit AES-GCM key used before financial data leaves the device
+- a separate 256-bit bearer token compared in constant time
+- the ephemeral TLS certificate and a random session identifier
 
-The key is never sent in an HTTP request. A device needs physical access to the QR code and access to the same network to pair. The current protocol is versioned so future clients can reject incompatible payloads instead of guessing.
+The encryption key is never sent in a network request. The native client accepts only `https://` endpoints on private IP addresses, rejects redirects and public hosts, caps payload size, and binds ciphertext to its session with authenticated additional data. Pairing details and the ledger are encrypted locally with a non-exportable device key. Legacy plaintext storage is removed after a successful migration.
 
 ## Release channels
 
@@ -95,6 +97,7 @@ Only these branches publish builds. Every release includes Windows, macOS, Linux
 ```bash
 npm test
 npm run build
+cargo test --locked --manifest-path src-tauri/Cargo.toml
 cargo check --locked --manifest-path src-tauri/Cargo.toml
 ```
 
@@ -110,7 +113,7 @@ scripts/                Branch-aware release versioning
 
 ## Privacy notes
 
-Leafy does not connect to banks and does not upload a ledger to a Leafy service. OpenRouter receives only descriptions that you submit with `Auto` selected. Local-network sync is end-to-end encrypted, but anyone who can photograph an active pairing QR code can join that pairing session. Treat it like a password and close the dialog when you are done.
+Leafy does not connect to banks and does not upload a ledger to a Leafy service. OpenRouter receives only descriptions that you submit with `Auto` selected. Someone who can unlock or fully compromise your device can still access data the app can access, and anyone who photographs an active pairing QR can join that time-limited session. Treat the QR like a password and disconnect the device when you are done. See [SECURITY.md](SECURITY.md) for the threat model and private reporting process.
 
 ## Contributing
 

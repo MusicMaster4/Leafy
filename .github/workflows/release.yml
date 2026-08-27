@@ -74,6 +74,7 @@ jobs:
           workspaces: src-tauri -> target
           key: release-validation
       - run: npm ci
+      - run: npm run icons:verify
       - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
       - run: npm test
       - run: npm run build

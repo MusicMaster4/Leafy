@@ -1,7 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react'
 import {
   ArrowDownRight, ArrowLeftRight, ArrowUpRight, Bell, ChevronDown, CircleDollarSign,
-  Eye, EyeOff, KeyRound, LayoutDashboard, Leaf, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
+  Eye, EyeOff, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
   ReceiptText, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Trash2, TrendingUp, Unplug,
   WalletCards, WandSparkles, X,
 } from 'lucide-react'
@@ -16,6 +16,8 @@ import { categorySeries, dailySeries, lastDays, money, parseAmount, summarize } 
 import { demoTransactions } from './data'
 import { expenseCategories, incomeCategories, type Transaction, type TransactionType } from './types'
 import { categorizeWithAi, configureOpenRouter } from './ai'
+import leafyIcon from '../src-tauri/icons/app-icon.svg'
+import { secureGet, secureSet } from './storage'
 import {
   createPairing, forgetPeer, mergeTransactions, parsePairing, pullFromPeer, pushToPeer,
   rememberPeer, savedPeer, scanPairingCode, serializePairing, type PairingDetails,
@@ -27,15 +29,30 @@ const COLORS: Record<string, string> = {
 }
 
 function useTransactions() {
-  const [transactions, setTransactions] = useState<Transaction[]>(() => {
-    try {
-      const saved = localStorage.getItem('leafy-transactions') ?? localStorage.getItem('lumina-transactions')
-      if (saved) return JSON.parse(saved)
-      return new URLSearchParams(window.location.search).has('demo') ? demoTransactions : []
-    } catch { return [] }
-  })
-  useEffect(() => localStorage.setItem('leafy-transactions', JSON.stringify(transactions)), [transactions])
-  return [transactions, setTransactions] as const
+  const [transactions, setTransactions] = useState<Transaction[]>([])
+  const [ready, setReady] = useState(false)
+  const [storageError, setStorageError] = useState(false)
+  useEffect(() => {
+    void (async () => {
+      try {
+        let rows = await secureGet<Transaction[]>('transactions')
+        if (!rows) {
+          const legacy = localStorage.getItem('leafy-transactions') ?? localStorage.getItem('lumina-transactions')
+          rows = legacy ? JSON.parse(legacy) as Transaction[] : new URLSearchParams(window.location.search).has('demo') ? demoTransactions : []
+          await secureSet('transactions', rows)
+          localStorage.removeItem('leafy-transactions')
+          localStorage.removeItem('lumina-transactions')
+        }
+        setTransactions(rows)
+      } catch {
+        setStorageError(true)
+      } finally { setReady(true) }
+    })()
+  }, [])
+  useEffect(() => {
+    if (ready && !storageError) void secureSet('transactions', transactions).catch(() => setStorageError(true))
+  }, [ready, storageError, transactions])
+  return [transactions, setTransactions, ready, storageError] as const
 }
 
 function StatCard({ label, value, type, note, hidden }: { label: string; value: number; type: 'balance' | 'income' | 'expense'; note: string; hidden?: boolean }) {
@@ -84,8 +101,8 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
           <button type="button" className={type === 'expense' ? 'active expense' : ''} onClick={() => setType('expense')}><ArrowDownRight size={17} /> Spent</button>
           <button type="button" className={type === 'income' ? 'active income' : ''} onClick={() => setType('income')}><ArrowUpRight size={17} /> Received</button>
         </div>
-        <label className="amount-field"><span>Amount</span><div><b>R$</b><input id="amount" inputMode="decimal" placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} /></div></label>
-        <label className="input-label"><span>Description <i>optional</i></span><input placeholder={type === 'expense' ? 'Example: lunch, groceries...' : 'Example: salary, freelance...'} value={description} onChange={e => setDescription(e.target.value)} /></label>
+        <label className="amount-field"><span>Amount</span><div><b>R$</b><input id="amount" inputMode="decimal" maxLength={24} placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} /></div></label>
+        <label className="input-label"><span>Description <i>optional</i></span><input maxLength={200} placeholder={type === 'expense' ? 'Example: lunch, groceries...' : 'Example: salary, freelance...'} value={description} onChange={e => setDescription(e.target.value)} /></label>
         <div className="category-field"><span>Category</span><div className="category-chips"><button type="button" className={category === 'Auto' ? 'active auto' : ''} onClick={() => setCategory('Auto')}><WandSparkles size={12} /> Auto</button>{categories.map(item => <button type="button" className={category === item ? 'active' : ''} onClick={() => setCategory(item)} key={item}>{item}</button>)}</div>{category === 'Auto' && <small className="auto-hint">Leafy will categorize it with AI. Local matching is used when offline.</small>}</div>
         <button className={`save-button ${type}`} type="submit">Save {type === 'expense' ? 'expense' : 'income'} <span>↵</span></button>
         <p className="privacy-note">Stored only on this device</p>
@@ -136,7 +153,7 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
     setBusy(true); setStatus('Starting a private local connection...')
     try {
       const next = await createPairing(transactions)
-      setPeer(next); onPaired(next); setStatus('Ready. Scan this code with Leafy on your phone.')
+      await rememberPeer(next); setPeer(next); onPaired(next); setStatus('Ready for one hour. Scan this code with Leafy on your phone.')
     } catch { setStatus('Open Leafy as a desktop app to create a pairing code.') }
     finally { setBusy(false) }
   }
@@ -146,7 +163,7 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
     try {
       const next = details ?? parsePairing(pairingText.trim())
       const rows = await pullFromPeer(next)
-      rememberPeer(next); setPeer(next); onPaired(next); onMerge(rows)
+      await rememberPeer(next); setPeer(next); onPaired(next); onMerge(rows)
       setStatus(`Connected. Imported ${rows.length} transactions.`)
     } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not connect') }
     finally { setBusy(false) }
@@ -165,9 +182,9 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
       <div className="entry-head"><div><span className="eyebrow">PRIVATE SYNC</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')}><Smartphone size={16}/> This phone</button></div>
       {mode === 'show' ? <div className="sync-content">
-        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={190} level="M" bgColor="#f3fff8" fgColor="#10251b" /></div><p>Open Leafy on your phone, choose <b>Devices</b>, then scan this code.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
+        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={240} level="L" bgColor="#f3fff8" fgColor="#10251b" /></div><p>Open Leafy on your phone, choose <b>Devices</b>, then scan this code.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
       </div> : <div className="sync-content scan-content">
-        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>The QR code carries a one-time address and a 256-bit encryption key. Your financial data stays encrypted in transit.</p>
+        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>The time-limited QR carries a pinned TLS certificate and a separate 256-bit encryption key. Your financial data remains end-to-end encrypted.</p>
         <button className="scan-button" onClick={scanCode} disabled={busy}><QrCode size={17}/>{busy ? 'Opening camera...' : 'Scan QR code'}</button>
         <div className="manual-code"><span>or paste the pairing link</span><input aria-label="Pairing link" placeholder="leafy://pair?..." value={pairingText} onChange={event => setPairingText(event.target.value)}/><button onClick={() => connect()} disabled={!pairingText.trim() || busy}>Connect</button></div>
       </div>}
@@ -178,13 +195,13 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
 }
 
 export default function App() {
-  const [transactions, setTransactions] = useTransactions()
+  const [transactions, setTransactions, storageReady, storageError] = useTransactions()
   const [days, setDays] = useState(30)
   const [showBalance, setShowBalance] = useState(true)
   const [entryOpen, setEntryOpen] = useState(false)
   const [preferencesOpen, setPreferencesOpen] = useState(false)
   const [syncOpen, setSyncOpen] = useState(false)
-  const [peer, setPeer] = useState<PairingDetails | null>(() => savedPeer())
+  const [peer, setPeer] = useState<PairingDetails | null>(null)
   const [search, setSearch] = useState('')
   const [toast, setToast] = useState('')
   const periodRows = useMemo(() => lastDays(transactions, days), [transactions, days])
@@ -208,7 +225,22 @@ export default function App() {
   }, [])
 
   useEffect(() => {
+    if (storageError) setToast('Private storage could not be unlocked. Changes will not be saved.')
+  }, [storageError])
+
+  useEffect(() => {
+    void savedPeer().then(setPeer)
+  }, [])
+
+  useEffect(() => {
     if (!peer) return
+    const remaining = Date.parse(peer.expiresAt) - Date.now()
+    const timer = window.setTimeout(() => { forgetPeer(); setPeer(null) }, Math.max(0, remaining))
+    return () => window.clearTimeout(timer)
+  }, [peer])
+
+  useEffect(() => {
+    if (!peer || !storageReady) return
     const sync = async () => {
       try {
         const incoming = await pullFromPeer(peer)
@@ -221,15 +253,19 @@ export default function App() {
     sync()
     const timer = window.setInterval(sync, 5000)
     return () => window.clearInterval(timer)
-  }, [peer, setTransactions])
+  }, [peer, setTransactions, storageReady])
 
   useEffect(() => {
-    if (!peer) return
+    if (!peer || !storageReady) return
     const timer = window.setTimeout(() => pushToPeer(peer, transactions).catch(() => undefined), 700)
     return () => window.clearTimeout(timer)
-  }, [peer, transactions])
+  }, [peer, transactions, storageReady])
 
   const add = async (row: Transaction, useAi: boolean) => {
+    if (storageError) {
+      setToast('Unlock private storage before adding transactions.')
+      return
+    }
     setTransactions(current => [row, ...current])
     setEntryOpen(false)
     setToast(row.type === 'expense' ? 'Expense saved' : 'Income saved')
@@ -241,12 +277,14 @@ export default function App() {
       window.setTimeout(() => setToast(''), 2600)
     }
   }
-  const remove = (id: string) => setTransactions(current => current.filter(t => t.id !== id))
+  const remove = (id: string) => storageError
+    ? setToast('Unlock private storage before changing transactions.')
+    : setTransactions(current => current.filter(t => t.id !== id))
 
   return (
     <div className="app-shell">
       <aside>
-        <div className="brand"><span className="brand-mark"><Leaf size={21} /></span><div>Leafy<small>MONEY, SIMPLIFIED</small></div></div>
+        <div className="brand"><img className="brand-mark" src={leafyIcon} alt="" /><div>Leafy<small>MONEY, SIMPLIFIED</small></div></div>
         <nav>
           <button className="active"><LayoutDashboard size={19} />Overview</button>
           <button><ArrowLeftRight size={19} />Transactions</button>
