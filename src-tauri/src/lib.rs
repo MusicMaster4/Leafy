@@ -1,5 +1,5 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, State as AxumState},
     http::{header::AUTHORIZATION, HeaderMap, Response, StatusCode},
     routing::{get, post},
@@ -515,6 +515,36 @@ async fn download_sync(
         .unwrap()
 }
 
+async fn upload_sync(
+    AxumState(state): AxumState<SyncServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response<Body> {
+    if !is_authorized(&headers, &state) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::empty())
+            .unwrap();
+    }
+    let Ok(payload) = String::from_utf8(body.to_vec()) else {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Invalid encrypted sync payload"))
+            .unwrap();
+    };
+    if !valid_ciphertext(&payload) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Invalid encrypted sync payload"))
+            .unwrap();
+    }
+    *state.payload.write().await = payload;
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap()
+}
+
 async fn categorize_for_peer(
     AxumState(state): AxumState<SyncServerState>,
     headers: HeaderMap,
@@ -636,7 +666,7 @@ async fn start_pairing_server(
         openrouter_key: state.openrouter_key.clone(),
     };
     let app = Router::new()
-        .route("/sync", get(download_sync))
+        .route("/sync", get(download_sync).put(upload_sync))
         .route("/categorize", post(categorize_for_peer))
         .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
         .with_state(server_state);
@@ -764,6 +794,44 @@ async fn sync_download(
 }
 
 #[tauri::command]
+async fn sync_upload(
+    endpoint: String,
+    certificate: String,
+    token: String,
+    payload: String,
+) -> Result<(), String> {
+    let url = private_sync_url(&endpoint)?;
+    decode_token(&token)?;
+    if !valid_ciphertext(&payload) {
+        return Err("Invalid encrypted sync payload".into());
+    }
+    let response = private_sync_client(&certificate)?
+        .put(url)
+        .bearer_auth(token)
+        .header("content-type", "application/octet-stream")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|error| format!("Private sync failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Private sync returned {}", response.status()));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn read_hosted_sync_snapshot(state: State<'_, AppState>) -> Result<String, String> {
+    let hosted = state
+        .hosted_sync
+        .lock()
+        .map_err(|_| "Could not access the shared ledger")?
+        .clone()
+        .ok_or("Create a pairing code before syncing the shared ledger")?;
+    let payload = hosted.read().await.clone();
+    Ok(payload)
+}
+
+#[tauri::command]
 async fn publish_sync_snapshot(payload: String, state: State<'_, AppState>) -> Result<(), String> {
     if !valid_ciphertext(&payload) {
         return Err("Invalid encrypted sync payload".into());
@@ -838,6 +906,8 @@ pub fn run() {
             categorize_transaction,
             start_pairing_server,
             sync_download,
+            sync_upload,
+            read_hosted_sync_snapshot,
             publish_sync_snapshot,
             categorize_via_peer,
             check_for_updates,
@@ -970,7 +1040,7 @@ mod security_tests {
             openrouter_key: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
-            .route("/sync", get(download_sync))
+            .route("/sync", get(download_sync).put(upload_sync))
             .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
             .with_state(state);
         let server = axum_server::from_tcp_rustls(listener, tls).unwrap();
@@ -1009,7 +1079,11 @@ mod security_tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(upload.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            mirrored_payload.read().await.as_str(),
+            "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA"
+        );
 
         let other = generate_simple_self_signed(vec![address.to_string()]).unwrap();
         let wrong_pin = URL_SAFE_NO_PAD.encode(other.cert.der());

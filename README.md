@@ -96,9 +96,9 @@ Incoming files are limited to 10 MB and 10 PDF pages. Leafy accepts Android `con
 
 ## Private device sync
 
-The desktop app opens a one-hour, read-only HTTPS endpoint on a random port. It prefers Tailscale and falls back to the local network. The phone uses only the self-signed certificate carried by the QR code as its TLS trust store, so the certificate is pinned without disabling verification.
+The desktop app opens a one-hour HTTPS endpoint on a random port. It prefers Tailscale and falls back to the local network. The phone uses only the self-signed certificate carried by the QR code as its TLS trust store, so the certificate is pinned without disabling verification.
 
-The computer is the single source of truth. While paired, the phone mirrors the computer's transactions, recurring expenses, and display currency every few seconds. Additions, edits, and deletions are made on the computer; the phone keeps the last encrypted snapshot available if the computer briefly goes offline and resumes mirroring when it returns.
+While paired, the phone and computer share one ledger. Transactions, recurring expenses, deletions, and the display currency sync in both directions every second. Each device keeps its last encrypted local copy if the other briefly goes offline and resumes syncing when the private connection returns. Pair again after upgrading from an older read-only release to enable two-way sync.
 
 The QR code contains:
 
@@ -106,7 +106,7 @@ The QR code contains:
 - a separate 256-bit bearer token compared in constant time
 - the temporary TLS certificate and a random session identifier
 
-The native client accepts only `https://` endpoints on local/private addresses or Tailscale's `100.64.0.0/10` range. It rejects redirects, proxies, and public hosts, limits payload size, and binds ciphertext to its session with authenticated additional data. The desktop endpoint does not accept ledger uploads from the phone.
+The native client accepts only `https://` endpoints on local/private addresses or Tailscale's `100.64.0.0/10` range. It rejects redirects, proxies, and public hosts, limits payload size, and binds ciphertext to its session with authenticated additional data. The desktop endpoint accepts uploads only from a paired device presenting the session token, and the ledger remains encrypted end to end.
 
 If Windows Firewall has an explicit block rule for `leafy-financas.exe`, the phone cannot connect. Run `scripts/configure-windows-tailscale-firewall.ps1` once from an elevated PowerShell prompt. The script changes only TCP block rules for the installed Leafy executable and adds an inbound rule restricted to Tailscale IPv4 addresses on private network profiles.
 

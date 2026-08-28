@@ -13,6 +13,7 @@ export type PairingDetails = {
   expiresAt: string
   deviceName: string
   networkMode?: 'tailscale' | 'local'
+  writeAccess?: boolean
   role: 'host' | 'mirror'
 }
 
@@ -103,6 +104,7 @@ export async function createPairing(snapshot: LedgerSnapshot): Promise<PairingDe
     expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     deviceName: 'Leafy Desktop',
     networkMode,
+    writeAccess: true,
     role: 'host',
   }
 }
@@ -118,6 +120,7 @@ export function serializePairing(details: PairingDetails) {
     x: details.expiresAt,
     d: details.deviceName,
     ...(details.networkMode ? { n: details.networkMode } : {}),
+    ...(details.writeAccess ? { w: '1' } : {}),
   })
   return `leafy://pair?${query}`
 }
@@ -139,6 +142,7 @@ export function parsePairing(value: string): PairingDetails {
         expiresAt: url.searchParams.get('x') ?? '',
         deviceName: url.searchParams.get('d') ?? 'Leafy Desktop',
         ...(url.searchParams.has('n') ? { networkMode: url.searchParams.get('n') === 'tailscale' ? 'tailscale' as const : 'local' as const } : {}),
+        ...(url.searchParams.get('w') === '1' ? { writeAccess: true } : {}),
       } as PairingDetails
   if (details.version !== 2 || !details.endpoint || !details.token || !details.key || !details.certificate || !details.sessionId) throw new Error('Unsupported pairing code')
   if (decode(details.token).length !== 32 || decode(details.key).length !== 32 || decode(details.sessionId).length !== 16) throw new Error('Invalid pairing secrets')
@@ -175,10 +179,24 @@ export async function pullFromPeer(peer: PairingDetails) {
   return decryptSnapshot(payload, peer.key, peer.sessionId)
 }
 
+export async function pullHostedSnapshot(peer: PairingDetails) {
+  if (peer.role !== 'host') throw new Error('Only the computer can read its shared ledger')
+  const payload = await invoke<string>('read_hosted_sync_snapshot')
+  return decryptSnapshot(payload, peer.key, peer.sessionId)
+}
+
 export async function publishSnapshot(peer: PairingDetails, snapshot: LedgerSnapshot) {
-  if (peer.role !== 'host') throw new Error('Only the computer can publish the mirrored ledger')
-  await invoke<void>('publish_sync_snapshot', {
-    payload: await encryptSnapshot(snapshot, peer.key, peer.sessionId),
+  const payload = await encryptSnapshot(snapshot, peer.key, peer.sessionId)
+  if (peer.role === 'host') {
+    await invoke<void>('publish_sync_snapshot', { payload })
+    return
+  }
+  if (peer.writeAccess !== true) throw new Error('Pair this phone again to enable two-way sync')
+  await invoke<void>('sync_upload', {
+    endpoint: peer.endpoint,
+    certificate: peer.certificate,
+    token: peer.token,
+    payload,
   })
 }
 

@@ -23,7 +23,7 @@ import leafyIcon from '../src-tauri/icons/app-icon.svg'
 import { secureGet, secureSet } from './storage'
 import { analyzeReceipt, isSharedReceipt, type SharedReceipt } from './receipt'
 import {
-  createPairing, forgetPeer, parsePairing, publishSnapshot, pullFromPeer,
+  createPairing, forgetPeer, parsePairing, publishSnapshot, pullFromPeer, pullHostedSnapshot,
   rememberPeer, savedPeer, scanPairingCode, serializePairing, type LedgerSnapshot, type PairingDetails,
 } from './sync'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
@@ -172,16 +172,17 @@ function AddTransaction({ onClose, onAdd, onSchedule }: {
         </div>}
         <div className="category-field"><span>Category</span><div className="category-chips"><button type="button" className={category === 'Auto' ? 'active auto' : ''} onClick={() => setCategory('Auto')}><WandSparkles size={12} /> Auto</button>{categories.map(item => <button type="button" className={category === item ? 'active' : ''} onClick={() => setCategory(item)} key={item}>{item}</button>)}</div>{category === 'Auto' && <small className="auto-hint">Leafy will categorize it with AI. Local matching is used when offline.</small>}</div>
         <button className={`save-button ${type}`} type="submit">{recurring ? 'Schedule monthly expense' : `Save ${type === 'expense' ? 'expense' : 'income'}`} <span>↵</span></button>
-        <p className="privacy-note">Stored only on this device</p>
+        <p className="privacy-note">Stored privately on your devices</p>
       </form>
     </div>
   )
 }
 
-function PreferencesPanel({ currency, checkingUpdates, mirrorMode, openRouterConfigured, onCurrencyChange, onKeyConfigured, onCheckUpdates, onClose, onNotice }: {
+function PreferencesPanel({ currency, checkingUpdates, mirrorMode, editableLedger, openRouterConfigured, onCurrencyChange, onKeyConfigured, onCheckUpdates, onClose, onNotice }: {
   currency: CurrencyCode
   checkingUpdates: boolean
   mirrorMode: boolean
+  editableLedger: boolean
   openRouterConfigured: boolean
   onCurrencyChange: (currency: CurrencyCode) => Promise<void>
   onKeyConfigured: () => void
@@ -207,13 +208,14 @@ function PreferencesPanel({ currency, checkingUpdates, mirrorMode, openRouterCon
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry preferences-panel" onSubmit={save}>
       <div className="entry-head"><div><span className="eyebrow">Preferences</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
-      {mirrorMode ? <div className="privacy-callout mirror-callout"><Smartphone size={20}/><div><b>Controlled by your computer</b><span>Currency, transactions, recurring expenses, and AI settings come from the desktop while this phone is paired.</span></div></div> : <>
-        <label className="input-label"><span>Display currency</span><select value={selectedCurrency} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
+      {mirrorMode && <div className="privacy-callout mirror-callout"><Smartphone size={20}/><div><b>{editableLedger ? 'Shared with your computer' : 'Pair again to edit'}</b><span>{editableLedger ? 'Currency and ledger changes made here sync to both devices.' : 'This older pairing remains read only.'}</span></div></div>}
+      <label className="input-label"><span>Display currency</span><select value={selectedCurrency} disabled={!editableLedger} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
+      {!mirrorMode && <>
         <div className="privacy-callout"><KeyRound size={20}/><div><b>One key on your computer</b><span>The key is encrypted on this device. A paired phone asks the computer to categorize; the raw key is never copied to the phone.</span></div></div>
         <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder={openRouterConfigured ? 'Saved securely — enter a new key to replace it' : 'sk-or-v1-...'} value={key} onChange={event => setKey(event.target.value)} />{openRouterConfigured && <small>An encrypted key is already saved on this device.</small>}</label>
       </>}
       <div className="preferences-update"><div><b>App updates</b><span>Check GitHub Releases for the newest version of your installed channel.</span></div><button type="button" onClick={() => void onCheckUpdates()} disabled={checkingUpdates}><RefreshCw size={15} className={checkingUpdates ? 'spinning' : ''}/>{checkingUpdates ? 'Checking...' : 'Check for updates'}</button></div>
-      {!mirrorMode && <button className="save-button income" disabled={saving}>{saving ? 'Saving...' : 'Save preferences'}</button>}
+      <button className="save-button income" disabled={saving || !editableLedger}>{saving ? 'Saving...' : 'Save preferences'}</button>
       <p className="privacy-note">Transactions, preferences, and the encrypted key stay in app data during in-place updates.</p>
     </form>
   </div>
@@ -288,7 +290,7 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
   const [mode, setMode] = useState<'show' | 'scan'>(initialPeer?.role === 'mirror' || mobileRuntime ? 'scan' : 'show')
   const [peer, setPeer] = useState<PairingDetails | null>(initialPeer)
   const [pairingText, setPairingText] = useState('')
-  const [status, setStatus] = useState(initialPeer ? `${initialPeer.role === 'mirror' ? 'Read-only mirror' : 'Computer sharing'} through ${initialPeer.networkMode === 'tailscale' ? 'Tailscale' : 'your local network'}` : '')
+  const [status, setStatus] = useState(initialPeer ? `${initialPeer.role === 'mirror' ? (initialPeer.writeAccess ? 'Two-way sync' : 'Read-only sync') : 'Computer sharing'} through ${initialPeer.networkMode === 'tailscale' ? 'Tailscale' : 'your local network'}` : '')
   const [busy, setBusy] = useState(false)
 
   const showCode = async () => {
@@ -306,7 +308,7 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
       const next = details ?? parsePairing(pairingText.trim())
       const incoming = await pullFromPeer(next)
       await rememberPeer(next); setPeer(next); onPaired(next); onSnapshot(incoming)
-      setStatus(`Read-only mirror connected. Showing ${incoming.transactions.length} desktop transactions.`)
+      setStatus(`${next.writeAccess ? 'Two-way sync' : 'Read-only sync'} connected. Showing ${incoming.transactions.length} transactions.`)
     } catch (error) {
       const message = errorMessage(error, 'Could not connect')
       setStatus(nextConnectionHint(details, pairingText, message))
@@ -327,9 +329,9 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
       <div className="entry-head"><div><span className="eyebrow">Private sync</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')} disabled={mobileRuntime}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')} disabled={!mobileRuntime}><Smartphone size={16}/> This phone</button></div>
       {mode === 'show' ? <div className="sync-content">
-        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b>. The phone receives a read-only mirror from this computer through Tailscale, with local Wi-Fi as a fallback.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>This computer remains the single source of truth. Leafy shares an encrypted, read-only mirror over Tailscale or local Wi-Fi.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
+        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b>. Changes made on either device sync through Tailscale, with local Wi-Fi as a fallback.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Leafy keeps one encrypted ledger shared between this computer and your phone over Tailscale or local Wi-Fi.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
       </div> : <div className="sync-content scan-content">
-        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>This phone becomes a read-only mirror. The time-limited QR pins the computer's TLS certificate and carries a separate 256-bit encryption key.</p>
+        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>This phone joins the same editable ledger. The time-limited QR pins the computer's TLS certificate and carries a separate 256-bit encryption key.</p>
         <button className="scan-button" onClick={scanCode} disabled={busy}><QrCode size={17}/>{busy ? 'Opening camera...' : 'Scan QR code'}</button>
         <div className="manual-code"><span>or paste the pairing link</span><input aria-label="Pairing link" placeholder="leafy://pair?..." value={pairingText} onChange={event => setPairingText(event.target.value)}/><button onClick={() => connect()} disabled={!pairingText.trim() || busy}>Connect</button></div>
       </div>}
@@ -376,6 +378,8 @@ export default function App() {
   const overviewRef = useRef<HTMLElement>(null)
   const transactionsRef = useRef<HTMLElement>(null)
   const insightsRef = useRef<HTMLElement>(null)
+  const ledgerSnapshotRef = useRef<LedgerSnapshot>({ transactions: [], recurringExpenses: [], currency: 'BRL' })
+  const syncBaselineRef = useRef<string | null>(null)
   const periodRows = useMemo(() => lastDays(transactions, days), [transactions, days])
   const summary = useMemo(() => summarize(periodRows), [periodRows])
   const allSummary = useMemo(() => summarize(transactions), [transactions])
@@ -388,7 +392,9 @@ export default function App() {
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7)
   const recurringSorted = [...recurringExpenses].sort((a, b) => nextRecurringDueDate(a).localeCompare(nextRecurringDueDate(b)))
   const mirrorMode = peer?.role === 'mirror'
+  const editableLedger = !mirrorMode || peer?.writeAccess === true
   const ledgerSnapshot = useMemo<LedgerSnapshot>(() => ({ transactions, recurringExpenses, currency }), [currency, recurringExpenses, transactions])
+  ledgerSnapshotRef.current = ledgerSnapshot
 
   const applySnapshot = (incoming: LedgerSnapshot) => {
     setTransactions(current => JSON.stringify(current) === JSON.stringify(incoming.transactions) ? current : incoming.transactions)
@@ -453,12 +459,12 @@ export default function App() {
 
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (!mirrorMode && event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) setEntryOpen(true)
+      if (editableLedger && event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) setEntryOpen(true)
       if (event.key === 'Escape') { setEntryOpen(false); setProfileMenuOpen(false) }
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
-  }, [mirrorMode])
+  }, [editableLedger])
 
   useEffect(() => {
     const progress = (event: Event) => {
@@ -516,7 +522,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (mirrorMode || !storageReady || !recurringReady || storageError || recurringStorageError) return
+    if (!editableLedger || !storageReady || !recurringReady || storageError || recurringStorageError) return
     const result = materializeRecurringExpenses(recurringExpenses, transactions, parseISO(todayKey))
     if (result.transactions.length) {
       setTransactions(current => {
@@ -528,7 +534,7 @@ export default function App() {
       window.setTimeout(() => setToast(''), 3200)
     }
     if (result.rules !== recurringExpenses) setRecurringExpenses(result.rules)
-  }, [mirrorMode, recurringExpenses, recurringReady, recurringStorageError, setRecurringExpenses, setTransactions, storageError, storageReady, todayKey])
+  }, [editableLedger, recurringExpenses, recurringReady, recurringStorageError, setRecurringExpenses, setTransactions, storageError, storageReady, todayKey])
 
   useEffect(() => {
     void savedPeer().then(setPeer)
@@ -542,34 +548,51 @@ export default function App() {
   }, [peer])
 
   useEffect(() => {
-    if (peer?.role !== 'mirror' || !storageReady || !recurringReady || !preferencesReady) return
+    syncBaselineRef.current = null
+    if (!peer || !storageReady || !recurringReady || !preferencesReady) return
     let active = true
+    let busy = false
     const sync = async () => {
+      if (busy) return
+      busy = true
       try {
-        const incoming = await pullFromPeer(peer)
-        if (active) applySnapshot(incoming)
-      } catch { /* The phone keeps its last encrypted mirror while the computer is offline. */ }
+        const local = ledgerSnapshotRef.current
+        const localKey = JSON.stringify(local)
+        const baseline = syncBaselineRef.current
+        if (baseline !== null && localKey !== baseline && (peer.role === 'host' || peer.writeAccess === true)) {
+          await publishSnapshot(peer, local)
+          if (active) syncBaselineRef.current = localKey
+          return
+        }
+        const incoming = peer.role === 'host' ? await pullHostedSnapshot(peer) : await pullFromPeer(peer)
+        if (!active) return
+        const incomingKey = JSON.stringify(incoming)
+        const latestLocalKey = JSON.stringify(ledgerSnapshotRef.current)
+        if (latestLocalKey !== localKey) {
+          if (baseline === null && incomingKey === localKey) syncBaselineRef.current = incomingKey
+          return
+        }
+        if (baseline === null || localKey === baseline) {
+          syncBaselineRef.current = incomingKey
+          if (incomingKey !== localKey) applySnapshot(incoming)
+        }
+      } catch { /* Keep local encrypted data and retry while the paired device is offline. */ }
+      finally { busy = false }
     }
-    sync()
-    const timer = window.setInterval(sync, 3000)
+    void sync()
+    const timer = window.setInterval(sync, 1000)
     return () => { active = false; window.clearInterval(timer) }
   }, [peer, preferencesReady, recurringReady, storageReady])
 
   useEffect(() => {
-    if (peer?.role !== 'host' || !storageReady || !recurringReady || !preferencesReady) return
-    const timer = window.setTimeout(() => publishSnapshot(peer, ledgerSnapshot).catch(() => undefined), 300)
-    return () => window.clearTimeout(timer)
-  }, [ledgerSnapshot, peer, preferencesReady, recurringReady, storageReady])
-
-  useEffect(() => {
-    if (!mirrorMode) return
+    if (editableLedger) return
     setEntryOpen(false)
     setSharedReceipt(null)
-  }, [mirrorMode])
+  }, [editableLedger])
 
   const add = async (row: Transaction, useAi: boolean) => {
-    if (mirrorMode) {
-      setToast('This phone mirrors your computer. Add transactions on the computer.')
+    if (!editableLedger) {
+      setToast('Pair this phone again to enable two-way sync.')
       return
     }
     if (storageError) {
@@ -588,8 +611,8 @@ export default function App() {
     }
   }
   const scheduleRecurring = async (rule: RecurringExpense, useAi: boolean) => {
-    if (mirrorMode) {
-      setToast('Recurring expenses are controlled by your computer.')
+    if (!editableLedger) {
+      setToast('Pair this phone again to enable two-way sync.')
       return
     }
     if (storageError || recurringStorageError) {
@@ -606,13 +629,13 @@ export default function App() {
       setTransactions(current => current.map(item => item.recurringExpenseId === rule.id ? { ...item, category } : item))
     }
   }
-  const remove = (id: string) => mirrorMode
-    ? setToast('This phone is a read-only mirror.')
+  const remove = (id: string) => !editableLedger
+    ? setToast('Pair this phone again to enable two-way sync.')
     : storageError
     ? setToast('Unlock private storage before changing transactions.')
     : setTransactions(current => current.filter(t => t.id !== id))
-  const removeRecurring = (id: string) => mirrorMode
-    ? setToast('Recurring expenses are controlled by your computer.')
+  const removeRecurring = (id: string) => !editableLedger
+    ? setToast('Pair this phone again to enable two-way sync.')
     : recurringStorageError
     ? setToast('Unlock private storage before changing recurring expenses.')
     : setRecurringExpenses(current => current.filter(rule => rule.id !== id))
@@ -683,9 +706,9 @@ export default function App() {
         <header ref={overviewRef}>
           <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting}<span>Your money, at a glance.</span></h1></div>
           <div className="header-actions">
-            {mirrorMode && <span className="mirror-badge"><Smartphone size={16}/><span><b>Desktop mirror</b><small>Read only</small></span></span>}
+            {mirrorMode && <span className="mirror-badge"><Smartphone size={16}/><span><b>{editableLedger ? 'Devices synced' : 'Legacy pairing'}</b><small>{editableLedger ? 'Two-way' : 'Read only'}</small></span></span>}
             <button className="icon-button mobile-settings" onClick={() => setPreferencesOpen(true)} aria-label="Preferences"><Settings size={20} /></button>
-            <button className="new-button" onClick={() => setEntryOpen(true)} disabled={mirrorMode} title={mirrorMode ? 'Add transactions on your computer' : undefined}><Plus size={18} />{mirrorMode ? 'Read-only mirror' : 'Add transaction'}{!mirrorMode && <kbd>N</kbd>}</button>
+            <button className="new-button" onClick={() => setEntryOpen(true)} disabled={!editableLedger} title={!editableLedger ? 'Pair again to enable two-way sync' : undefined}><Plus size={18} />{editableLedger ? 'Add transaction' : 'Read-only sync'}{editableLedger && <kbd>N</kbd>}</button>
           </div>
         </header>
 
@@ -700,7 +723,7 @@ export default function App() {
           <button className="balance-toggle" aria-pressed={!showBalance} onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
         </section>
 
-          <button className="mobile-add-button" onClick={() => setEntryOpen(true)} aria-label="Add transaction" disabled={mirrorMode} title={mirrorMode ? 'Add transactions on your computer' : undefined}><Plus size={21} /><span>{mirrorMode ? 'Mirroring' : 'Add'}</span></button>
+          <button className="mobile-add-button" onClick={() => setEntryOpen(true)} aria-label="Add transaction" disabled={!editableLedger} title={!editableLedger ? 'Pair again to enable two-way sync' : undefined}><Plus size={21} /><span>{editableLedger ? 'Add' : 'Read only'}</span></button>
 
         <section className="charts-grid dashboard-anchor" ref={insightsRef}>
           <article className="panel flow-panel">
@@ -728,7 +751,7 @@ export default function App() {
               <span className={`transaction-icon ${row.type}`}>{row.type === 'income' ? <ArrowUpRight size={18} /> : <ReceiptText size={18} />}</span>
               <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}{row.recurringExpenseId ? ' · Recurring' : ''}</span></div>
               <strong className={row.type}>{row.type === 'income' ? '+' : '−'} {money(row.amount, false, currency)}</strong>
-              <button className="delete-button" onClick={() => remove(row.id)} aria-label={`Delete ${row.description}`} disabled={mirrorMode}><Trash2 size={16} /></button>
+              <button className="delete-button" onClick={() => remove(row.id)} aria-label={`Delete ${row.description}`} disabled={!editableLedger}><Trash2 size={16} /></button>
             </div>)}</div>
           </article>
 
@@ -744,16 +767,16 @@ export default function App() {
               <span className="recurring-icon"><CalendarClock size={18}/></span>
               <div><b>{rule.description}</b><span>Day {rule.dayOfMonth} · Next {format(parseISO(nextRecurringDueDate(rule)), 'MMM d', { locale: enUS })}</span></div>
               <strong>{money(rule.amount, false, currency)}</strong>
-              <button className="delete-button" onClick={() => removeRecurring(rule.id)} aria-label={`Cancel recurring expense ${rule.description}`} disabled={mirrorMode}><Trash2 size={16}/></button>
+              <button className="delete-button" onClick={() => removeRecurring(rule.id)} aria-label={`Cancel recurring expense ${rule.description}`} disabled={!editableLedger}><Trash2 size={16}/></button>
             </div>)}</div>
           </article>}
         </section>
       </main>
 
-      {entryOpen && !mirrorMode && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} onSchedule={scheduleRecurring} />}
-      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} mirrorMode={mirrorMode} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => setCurrency(next)} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
+      {entryOpen && editableLedger && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} onSchedule={scheduleRecurring} />}
+      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} mirrorMode={mirrorMode} editableLedger={editableLedger} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => setCurrency(next)} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
       {syncOpen && <SyncPanel snapshot={ledgerSnapshot} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onSnapshot={applySnapshot} />}
-      {sharedReceipt && !mirrorMode && (
+      {sharedReceipt && editableLedger && (
         <ReceiptReview source={sharedReceipt} onClose={() => setSharedReceipt(null)} onAdd={(row, useAi) => {
           if (storageError) { setToast('Unlock private storage before importing a receipt.'); return }
           void add(row, useAi)

@@ -80,6 +80,12 @@ describe('pairing QR payload', () => {
     expect(parsePairing(code)).toEqual({ ...pairing, role: 'mirror' })
   })
 
+  it('advertises two-way sync only for new pairing codes', () => {
+    const editable = { ...pairing, writeAccess: true }
+    expect(parsePairing(serializePairing(editable))).toEqual({ ...editable, role: 'mirror' })
+    expect(parsePairing(serializePairing(pairing)).writeAccess).toBeUndefined()
+  })
+
   it('still accepts QR codes from earlier version 2 desktop builds', () => {
     const legacy = `leafy://pair?data=${encode(new TextEncoder().encode(JSON.stringify(pairing)))}`
     expect(parsePairing(legacy)).toEqual({ ...pairing, role: 'mirror' })
