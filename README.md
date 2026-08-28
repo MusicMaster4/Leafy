@@ -98,7 +98,7 @@ Incoming files are limited to 10 MB and 10 PDF pages. Leafy accepts Android `con
 
 The desktop app opens a one-hour HTTPS endpoint on a random port. It prefers Tailscale and falls back to the local network. The phone uses only the self-signed certificate carried by the QR code as its TLS trust store, so the certificate is pinned without disabling verification.
 
-While paired, the phone and computer share one ledger. Transactions, recurring expenses, deletions, and the display currency sync in both directions every second. Each device keeps its last encrypted local copy if the other briefly goes offline and resumes syncing when the private connection returns. Pair again after upgrading from an older read-only release to enable two-way sync.
+While paired, the phone and computer share one ledger. Transactions, recurring expenses, deletions, and the display currency sync in both directions every second. Each device keeps its last encrypted local copy if the other briefly goes offline and resumes syncing when the private connection returns.
 
 The QR code contains:
 

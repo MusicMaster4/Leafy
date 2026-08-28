@@ -178,11 +178,10 @@ function AddTransaction({ onClose, onAdd, onSchedule }: {
   )
 }
 
-function PreferencesPanel({ currency, checkingUpdates, mirrorMode, editableLedger, openRouterConfigured, onCurrencyChange, onKeyConfigured, onCheckUpdates, onClose, onNotice }: {
+function PreferencesPanel({ currency, checkingUpdates, mirrorMode, openRouterConfigured, onCurrencyChange, onKeyConfigured, onCheckUpdates, onClose, onNotice }: {
   currency: CurrencyCode
   checkingUpdates: boolean
   mirrorMode: boolean
-  editableLedger: boolean
   openRouterConfigured: boolean
   onCurrencyChange: (currency: CurrencyCode) => Promise<void>
   onKeyConfigured: () => void
@@ -208,14 +207,14 @@ function PreferencesPanel({ currency, checkingUpdates, mirrorMode, editableLedge
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry preferences-panel" onSubmit={save}>
       <div className="entry-head"><div><span className="eyebrow">Preferences</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
-      {mirrorMode && <div className="privacy-callout mirror-callout"><Smartphone size={20}/><div><b>{editableLedger ? 'Shared with your computer' : 'Pair again to edit'}</b><span>{editableLedger ? 'Currency and ledger changes made here sync to both devices.' : 'This older pairing remains read only.'}</span></div></div>}
-      <label className="input-label"><span>Display currency</span><select value={selectedCurrency} disabled={!editableLedger} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
+      {mirrorMode && <div className="privacy-callout mirror-callout"><Smartphone size={20}/><div><b>Shared with your computer</b><span>Currency and ledger changes made here sync to both devices.</span></div></div>}
+      <label className="input-label"><span>Display currency</span><select value={selectedCurrency} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
       {!mirrorMode && <>
         <div className="privacy-callout"><KeyRound size={20}/><div><b>One key on your computer</b><span>The key is encrypted on this device. A paired phone asks the computer to categorize; the raw key is never copied to the phone.</span></div></div>
         <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder={openRouterConfigured ? 'Saved securely — enter a new key to replace it' : 'sk-or-v1-...'} value={key} onChange={event => setKey(event.target.value)} />{openRouterConfigured && <small>An encrypted key is already saved on this device.</small>}</label>
       </>}
       <div className="preferences-update"><div><b>App updates</b><span>Check GitHub Releases for the newest version of your installed channel.</span></div><button type="button" onClick={() => void onCheckUpdates()} disabled={checkingUpdates}><RefreshCw size={15} className={checkingUpdates ? 'spinning' : ''}/>{checkingUpdates ? 'Checking...' : 'Check for updates'}</button></div>
-      <button className="save-button income" disabled={saving || !editableLedger}>{saving ? 'Saving...' : 'Save preferences'}</button>
+      <button className="save-button income" disabled={saving}>{saving ? 'Saving...' : 'Save preferences'}</button>
       <p className="privacy-note">Transactions, preferences, and the encrypted key stay in app data during in-place updates.</p>
     </form>
   </div>
@@ -290,7 +289,7 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
   const [mode, setMode] = useState<'show' | 'scan'>(initialPeer?.role === 'mirror' || mobileRuntime ? 'scan' : 'show')
   const [peer, setPeer] = useState<PairingDetails | null>(initialPeer)
   const [pairingText, setPairingText] = useState('')
-  const [status, setStatus] = useState(initialPeer ? `${initialPeer.role === 'mirror' ? (initialPeer.writeAccess ? 'Two-way sync' : 'Read-only sync') : 'Computer sharing'} through ${initialPeer.networkMode === 'tailscale' ? 'Tailscale' : 'your local network'}` : '')
+  const [status, setStatus] = useState(initialPeer ? `${initialPeer.role === 'mirror' ? 'Two-way sync' : 'Computer sharing'} through ${initialPeer.networkMode === 'tailscale' ? 'Tailscale' : 'your local network'}` : '')
   const [busy, setBusy] = useState(false)
 
   const showCode = async () => {
@@ -308,7 +307,7 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
       const next = details ?? parsePairing(pairingText.trim())
       const incoming = await pullFromPeer(next)
       await rememberPeer(next); setPeer(next); onPaired(next); onSnapshot(incoming)
-      setStatus(`${next.writeAccess ? 'Two-way sync' : 'Read-only sync'} connected. Showing ${incoming.transactions.length} transactions.`)
+      setStatus(`Two-way sync connected. Showing ${incoming.transactions.length} transactions.`)
     } catch (error) {
       const message = errorMessage(error, 'Could not connect')
       setStatus(nextConnectionHint(details, pairingText, message))
@@ -392,7 +391,6 @@ export default function App() {
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7)
   const recurringSorted = [...recurringExpenses].sort((a, b) => nextRecurringDueDate(a).localeCompare(nextRecurringDueDate(b)))
   const mirrorMode = peer?.role === 'mirror'
-  const editableLedger = !mirrorMode || peer?.writeAccess === true
   const ledgerSnapshot = useMemo<LedgerSnapshot>(() => ({ transactions, recurringExpenses, currency }), [currency, recurringExpenses, transactions])
   ledgerSnapshotRef.current = ledgerSnapshot
 
@@ -459,12 +457,12 @@ export default function App() {
 
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (editableLedger && event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) setEntryOpen(true)
+      if (event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) setEntryOpen(true)
       if (event.key === 'Escape') { setEntryOpen(false); setProfileMenuOpen(false) }
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
-  }, [editableLedger])
+  }, [])
 
   useEffect(() => {
     const progress = (event: Event) => {
@@ -522,7 +520,7 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    if (!editableLedger || !storageReady || !recurringReady || storageError || recurringStorageError) return
+    if (!storageReady || !recurringReady || storageError || recurringStorageError) return
     const result = materializeRecurringExpenses(recurringExpenses, transactions, parseISO(todayKey))
     if (result.transactions.length) {
       setTransactions(current => {
@@ -534,7 +532,7 @@ export default function App() {
       window.setTimeout(() => setToast(''), 3200)
     }
     if (result.rules !== recurringExpenses) setRecurringExpenses(result.rules)
-  }, [editableLedger, recurringExpenses, recurringReady, recurringStorageError, setRecurringExpenses, setTransactions, storageError, storageReady, todayKey])
+  }, [recurringExpenses, recurringReady, recurringStorageError, setRecurringExpenses, setTransactions, storageError, storageReady, todayKey])
 
   useEffect(() => {
     void savedPeer().then(setPeer)
@@ -559,7 +557,7 @@ export default function App() {
         const local = ledgerSnapshotRef.current
         const localKey = JSON.stringify(local)
         const baseline = syncBaselineRef.current
-        if (baseline !== null && localKey !== baseline && (peer.role === 'host' || peer.writeAccess === true)) {
+        if (baseline !== null && localKey !== baseline) {
           await publishSnapshot(peer, local)
           if (active) syncBaselineRef.current = localKey
           return
@@ -584,17 +582,7 @@ export default function App() {
     return () => { active = false; window.clearInterval(timer) }
   }, [peer, preferencesReady, recurringReady, storageReady])
 
-  useEffect(() => {
-    if (editableLedger) return
-    setEntryOpen(false)
-    setSharedReceipt(null)
-  }, [editableLedger])
-
   const add = async (row: Transaction, useAi: boolean) => {
-    if (!editableLedger) {
-      setToast('Pair this phone again to enable two-way sync.')
-      return
-    }
     if (storageError) {
       setToast('Unlock private storage before adding transactions.')
       return
@@ -611,10 +599,6 @@ export default function App() {
     }
   }
   const scheduleRecurring = async (rule: RecurringExpense, useAi: boolean) => {
-    if (!editableLedger) {
-      setToast('Pair this phone again to enable two-way sync.')
-      return
-    }
     if (storageError || recurringStorageError) {
       setToast('Unlock private storage before scheduling recurring expenses.')
       return
@@ -629,14 +613,10 @@ export default function App() {
       setTransactions(current => current.map(item => item.recurringExpenseId === rule.id ? { ...item, category } : item))
     }
   }
-  const remove = (id: string) => !editableLedger
-    ? setToast('Pair this phone again to enable two-way sync.')
-    : storageError
+  const remove = (id: string) => storageError
     ? setToast('Unlock private storage before changing transactions.')
     : setTransactions(current => current.filter(t => t.id !== id))
-  const removeRecurring = (id: string) => !editableLedger
-    ? setToast('Pair this phone again to enable two-way sync.')
-    : recurringStorageError
+  const removeRecurring = (id: string) => recurringStorageError
     ? setToast('Unlock private storage before changing recurring expenses.')
     : setRecurringExpenses(current => current.filter(rule => rule.id !== id))
 
@@ -706,9 +686,9 @@ export default function App() {
         <header ref={overviewRef}>
           <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting}<span>Your money, at a glance.</span></h1></div>
           <div className="header-actions">
-            {mirrorMode && <span className="mirror-badge"><Smartphone size={16}/><span><b>{editableLedger ? 'Devices synced' : 'Legacy pairing'}</b><small>{editableLedger ? 'Two-way' : 'Read only'}</small></span></span>}
+            {mirrorMode && <span className="mirror-badge"><Smartphone size={16}/><span><b>Devices synced</b><small>Two-way</small></span></span>}
             <button className="icon-button mobile-settings" onClick={() => setPreferencesOpen(true)} aria-label="Preferences"><Settings size={20} /></button>
-            <button className="new-button" onClick={() => setEntryOpen(true)} disabled={!editableLedger} title={!editableLedger ? 'Pair again to enable two-way sync' : undefined}><Plus size={18} />{editableLedger ? 'Add transaction' : 'Read-only sync'}{editableLedger && <kbd>N</kbd>}</button>
+            <button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={18} />Add transaction<kbd>N</kbd></button>
           </div>
         </header>
 
@@ -723,7 +703,7 @@ export default function App() {
           <button className="balance-toggle" aria-pressed={!showBalance} onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
         </section>
 
-          <button className="mobile-add-button" onClick={() => setEntryOpen(true)} aria-label="Add transaction" disabled={!editableLedger} title={!editableLedger ? 'Pair again to enable two-way sync' : undefined}><Plus size={21} /><span>{editableLedger ? 'Add' : 'Read only'}</span></button>
+          <button className="mobile-add-button" onClick={() => setEntryOpen(true)} aria-label="Add transaction"><Plus size={21} /><span>Add</span></button>
 
         <section className="charts-grid dashboard-anchor" ref={insightsRef}>
           <article className="panel flow-panel">
@@ -751,7 +731,7 @@ export default function App() {
               <span className={`transaction-icon ${row.type}`}>{row.type === 'income' ? <ArrowUpRight size={18} /> : <ReceiptText size={18} />}</span>
               <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}{row.recurringExpenseId ? ' · Recurring' : ''}</span></div>
               <strong className={row.type}>{row.type === 'income' ? '+' : '−'} {money(row.amount, false, currency)}</strong>
-              <button className="delete-button" onClick={() => remove(row.id)} aria-label={`Delete ${row.description}`} disabled={!editableLedger}><Trash2 size={16} /></button>
+              <button className="delete-button" onClick={() => remove(row.id)} aria-label={`Delete ${row.description}`}><Trash2 size={16} /></button>
             </div>)}</div>
           </article>
 
@@ -767,16 +747,16 @@ export default function App() {
               <span className="recurring-icon"><CalendarClock size={18}/></span>
               <div><b>{rule.description}</b><span>Day {rule.dayOfMonth} · Next {format(parseISO(nextRecurringDueDate(rule)), 'MMM d', { locale: enUS })}</span></div>
               <strong>{money(rule.amount, false, currency)}</strong>
-              <button className="delete-button" onClick={() => removeRecurring(rule.id)} aria-label={`Cancel recurring expense ${rule.description}`} disabled={!editableLedger}><Trash2 size={16}/></button>
+              <button className="delete-button" onClick={() => removeRecurring(rule.id)} aria-label={`Cancel recurring expense ${rule.description}`}><Trash2 size={16}/></button>
             </div>)}</div>
           </article>}
         </section>
       </main>
 
-      {entryOpen && editableLedger && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} onSchedule={scheduleRecurring} />}
-      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} mirrorMode={mirrorMode} editableLedger={editableLedger} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => setCurrency(next)} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
+      {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} onSchedule={scheduleRecurring} />}
+      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} mirrorMode={mirrorMode} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => setCurrency(next)} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
       {syncOpen && <SyncPanel snapshot={ledgerSnapshot} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onSnapshot={applySnapshot} />}
-      {sharedReceipt && editableLedger && (
+      {sharedReceipt && (
         <ReceiptReview source={sharedReceipt} onClose={() => setSharedReceipt(null)} onAdd={(row, useAi) => {
           if (storageError) { setToast('Unlock private storage before importing a receipt.'); return }
           void add(row, useAi)
