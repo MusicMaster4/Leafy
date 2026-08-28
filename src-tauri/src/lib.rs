@@ -705,14 +705,22 @@ fn private_sync_client(certificate: &str) -> Result<reqwest::Client, String> {
     if der.is_empty() || der.len() > 4096 {
         return Err("Invalid pairing certificate".into());
     }
-    let certificate =
-        reqwest::Certificate::from_der(&der).map_err(|_| "Invalid pairing certificate")?;
+    // Build the pinned rustls configuration ourselves. In particular, do not
+    // pass this private certificate through reqwest's platform verifier:
+    // Android cannot merge app-provided roots into that verifier and reports
+    // only an opaque `builder error` before the request is sent.
+    ensure_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .map_err(|_| "Invalid pairing certificate")?;
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     reqwest::Client::builder()
-        // `add_root_certificate` asks reqwest's Android platform verifier to
-        // merge an extra root, a configuration it does not support. An
-        // exclusive store both fixes Android's builder error and makes the QR
-        // certificate a real pin instead of an additional trusted root.
-        .tls_certs_only([certificate])
+        // A preconfigured rustls backend keeps the QR certificate as the only
+        // trust anchor on every platform and bypasses Android's system store.
+        .tls_backend_preconfigured(tls)
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
