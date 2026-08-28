@@ -23,8 +23,9 @@ import leafyIcon from '../src-tauri/icons/app-icon.svg'
 import { secureGet, secureSet } from './storage'
 import { analyzeReceipt, isSharedReceipt, type SharedReceipt } from './receipt'
 import {
-  createPairing, forgetPeer, parsePairing, publishSnapshot, pullFromPeer, pullHostedSnapshot,
-  rememberPeer, savedPeer, scanPairingCode, serializePairing, type LedgerSnapshot, type PairingDetails,
+  completePairing, createPairing, forgetPeer, mergeSnapshots, parsePairing, publishSnapshot, pullFromPeer, pullHostedSnapshot,
+  rememberPeer, rememberSyncCheckpoint, resumeHostedSync, savedPeer, savedSyncCheckpoint, scanPairingCode,
+  serializePairing, snapshotEquals, type LedgerSnapshot, type PairingDetails,
 } from './sync'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { canInstallAndroidUpdate, checkForUpdates, installAndroidUpdate, installDesktopUpdate, type UpdateCheck } from './updates'
@@ -278,12 +279,11 @@ function ReceiptReview({ source, onClose, onAdd }: {
   </div>
 }
 
-function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
+function SyncPanel({ snapshot, initialPeer, onClose, onPaired }: {
   snapshot: LedgerSnapshot
   initialPeer: PairingDetails | null
   onClose: () => void
   onPaired: (peer: PairingDetails | null) => void
-  onSnapshot: (snapshot: LedgerSnapshot) => void
 }) {
   const mobileRuntime = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
   const [mode, setMode] = useState<'show' | 'scan'>(initialPeer?.role === 'mirror' || mobileRuntime ? 'scan' : 'show')
@@ -296,7 +296,9 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
     setBusy(true); setStatus('Starting a private local connection...')
     try {
       const next = await createPairing(snapshot)
-      await rememberPeer(next); setPeer(next); onPaired(next); setStatus(next.networkMode === 'tailscale' ? 'Tailscale found. Ready for one hour — scan this code on your phone.' : 'Ready for one hour on your local network — scan this code on your phone.')
+      await rememberSyncCheckpoint(next, snapshot)
+      await rememberPeer(next)
+      setPeer(next); onPaired(next); setStatus(next.networkMode === 'tailscale' ? 'Tailscale found. Scan within one hour; the connection then stays paired. Closing this window keeps sync running.' : 'Scan within one hour on your local network; the connection then stays paired. Closing this window keeps sync running.')
     } catch (error) { setStatus(errorMessage(error, 'Open Leafy as a desktop app to create a pairing code.')) }
     finally { setBusy(false) }
   }
@@ -304,10 +306,13 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
   const connect = async (details?: PairingDetails) => {
     setBusy(true); setStatus('Connecting securely...')
     try {
-      const next = details ?? parsePairing(pairingText.trim())
-      const incoming = await pullFromPeer(next)
-      await rememberPeer(next); setPeer(next); onPaired(next); onSnapshot(incoming)
-      setStatus(`Two-way sync connected. Showing ${incoming.transactions.length} transactions.`)
+      const next = await completePairing(details ?? parsePairing(pairingText.trim()))
+      // Store the durable credential as soon as the pinned exchange succeeds.
+      // A transient failure on the first ledger download must not force the
+      // user to scan again after the invitation expires.
+      await rememberPeer(next)
+      setPeer(next); onPaired(next)
+      setStatus('Two-way sync connected permanently. Reconciling both encrypted ledgers now.')
     } catch (error) {
       const message = errorMessage(error, 'Could not connect')
       setStatus(nextConnectionHint(details, pairingText, message))
@@ -321,16 +326,16 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
     catch (error) { setStatus(errorMessage(error, 'Could not scan the code')); setBusy(false) }
   }
 
-  const disconnect = () => { forgetPeer(); setPeer(null); onPaired(null); setStatus('Device disconnected') }
-  const code = peer?.role === 'host' ? serializePairing(peer) : ''
+  const disconnect = () => { void forgetPeer(); setPeer(null); onPaired(null); setStatus('Device disconnected') }
+  const code = peer?.role === 'host' && Date.parse(peer.expiresAt) > Date.now() ? serializePairing(peer) : ''
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <div className="quick-entry sync-panel">
       <div className="entry-head"><div><span className="eyebrow">Private sync</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
       <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')} disabled={mobileRuntime}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')} disabled={!mobileRuntime}><Smartphone size={16}/> This phone</button></div>
       {mode === 'show' ? <div className="sync-content">
-        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b>. Changes made on either device sync through Tailscale, with local Wi-Fi as a fallback.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Leafy keeps one encrypted ledger shared between this computer and your phone over Tailscale or local Wi-Fi.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
+        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b>. Scan within one hour. After pairing, changes sync in both directions and reconnect automatically.</p></> : <div className="sync-empty"><QrCode size={42}/><b>{peer ? 'Create a fresh pairing code' : 'Pair with your phone'}</b><span>{peer ? 'This device remains paired. Create a new code only if you need to pair the phone again.' : 'Leafy keeps one encrypted ledger shared between this computer and your phone over Tailscale or local Wi-Fi.'}</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
       </div> : <div className="sync-content scan-content">
-        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>This phone joins the same editable ledger. The time-limited QR pins the computer's TLS certificate and carries a separate 256-bit encryption key.</p>
+        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>This phone joins the same editable ledger permanently. The QR itself is valid for one hour and pins the computer's TLS certificate.</p>
         <button className="scan-button" onClick={scanCode} disabled={busy}><QrCode size={17}/>{busy ? 'Opening camera...' : 'Scan QR code'}</button>
         <div className="manual-code"><span>or paste the pairing link</span><input aria-label="Pairing link" placeholder="leafy://pair?..." value={pairingText} onChange={event => setPairingText(event.target.value)}/><button onClick={() => connect()} disabled={!pairingText.trim() || busy}>Connect</button></div>
       </div>}
@@ -385,7 +390,6 @@ export default function App() {
   const transactionsRef = useRef<HTMLElement>(null)
   const insightsRef = useRef<HTMLElement>(null)
   const ledgerSnapshotRef = useRef<LedgerSnapshot>({ transactions: [], recurringExpenses: [], currency: 'BRL' })
-  const syncBaselineRef = useRef<string | null>(null)
   const periodRows = useMemo(() => lastDays(transactions, days), [transactions, days])
   const summary = useMemo(() => summarize(periodRows), [periodRows])
   const allSummary = useMemo(() => summarize(transactions), [transactions])
@@ -544,44 +548,59 @@ export default function App() {
   }, [recurringExpenses, recurringReady, recurringStorageError, setRecurringExpenses, setTransactions, storageError, storageReady, todayKey])
 
   useEffect(() => {
-    void savedPeer().then(setPeer)
+    void savedPeer().then(saved => setPeer(current => current ?? saved))
   }, [])
 
   useEffect(() => {
-    if (!peer) return
-    const remaining = Date.parse(peer.expiresAt) - Date.now()
-    const timer = window.setTimeout(() => { forgetPeer(); setPeer(null) }, Math.max(0, remaining))
-    return () => window.clearTimeout(timer)
-  }, [peer])
-
-  useEffect(() => {
-    syncBaselineRef.current = null
-    if (!peer || !storageReady || !recurringReady || !preferencesReady) return
+    if (!peer || !storageReady || !recurringReady || !preferencesReady || storageError || recurringStorageError) return
     let active = true
     let busy = false
+    let checkpointLoaded = false
+    let hostedServerReady = peer.role !== 'host'
+    let baseline: LedgerSnapshot | null = null
     const sync = async () => {
       if (busy) return
       busy = true
       try {
-        const local = ledgerSnapshotRef.current
-        const localKey = JSON.stringify(local)
-        const baseline = syncBaselineRef.current
-        if (baseline !== null && localKey !== baseline) {
-          await publishSnapshot(peer, local)
-          if (active) syncBaselineRef.current = localKey
-          return
+        if (!checkpointLoaded) {
+          baseline = await savedSyncCheckpoint(peer)
+          checkpointLoaded = true
         }
-        const incoming = peer.role === 'host' ? await pullHostedSnapshot(peer) : await pullFromPeer(peer)
         if (!active) return
-        const incomingKey = JSON.stringify(incoming)
-        const latestLocalKey = JSON.stringify(ledgerSnapshotRef.current)
-        if (latestLocalKey !== localKey) {
-          if (baseline === null && incomingKey === localKey) syncBaselineRef.current = incomingKey
-          return
+        if (!hostedServerReady) {
+          await resumeHostedSync(peer, ledgerSnapshotRef.current)
+          hostedServerReady = true
         }
-        if (baseline === null || localKey === baseline) {
-          syncBaselineRef.current = incomingKey
-          if (incomingKey !== localKey) applySnapshot(incoming)
+        if (!active) return
+        // A compare-and-swap retry prevents two devices that write at the same
+        // moment from replacing one another's complete encrypted snapshot.
+        for (let attempt = 0; active && attempt < 4; attempt += 1) {
+          const remote = peer.role === 'host' ? await pullHostedSnapshot(peer) : await pullFromPeer(peer)
+          if (!active) return
+          const local = ledgerSnapshotRef.current
+          const merged = mergeSnapshots(baseline, local, remote.snapshot)
+          if (!snapshotEquals(local, ledgerSnapshotRef.current)) continue
+          try {
+            if (!snapshotEquals(merged, remote.snapshot)) {
+              await publishSnapshot(peer, merged, remote.revision)
+            }
+          } catch (error) {
+            if (errorMessage(error, '').toLowerCase().includes('conflict')) continue
+            throw error
+          }
+          if (!active) return
+          const previousBaseline = baseline
+          baseline = merged
+          if (!previousBaseline || !snapshotEquals(previousBaseline, merged)) {
+            await rememberSyncCheckpoint(peer, merged)
+          }
+          // Do not overwrite an edit made while the network request was in
+          // flight. It remains different from the new baseline and is sent on
+          // the next tick.
+          if (snapshotEquals(local, ledgerSnapshotRef.current) && !snapshotEquals(local, merged)) {
+            applySnapshot(merged)
+          }
+          return
         }
       } catch { /* Keep local encrypted data and retry while the paired device is offline. */ }
       finally { busy = false }
@@ -589,7 +608,7 @@ export default function App() {
     void sync()
     const timer = window.setInterval(sync, 1000)
     return () => { active = false; window.clearInterval(timer) }
-  }, [peer, preferencesReady, recurringReady, storageReady])
+  }, [peer, preferencesReady, recurringReady, recurringStorageError, storageError, storageReady])
 
   const add = async (row: Transaction, useAi: boolean) => {
     if (storageError) {
@@ -782,7 +801,7 @@ export default function App() {
 
       {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} onSchedule={scheduleRecurring} />}
       {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} mirrorMode={mirrorMode} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => setCurrency(next)} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
-      {syncOpen && <SyncPanel snapshot={ledgerSnapshot} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onSnapshot={applySnapshot} />}
+      {syncOpen && <SyncPanel snapshot={ledgerSnapshot} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} />}
       {sharedReceipt && (
         <ReceiptReview source={sharedReceipt} onClose={() => setSharedReceipt(null)} onAdd={(row, useAi) => {
           if (storageError) { setToast('Unlock private storage before importing a receipt.'); return }

@@ -15,6 +15,7 @@ function openDatabase() {
 }
 
 let keyPromise: Promise<CryptoKey> | undefined
+const pendingWrites = new Map<string, Promise<void>>()
 
 async function loadDeviceKey() {
   const database = await openDatabase()
@@ -48,7 +49,20 @@ function deviceKey() {
 
 const additionalData = (name: string) => new TextEncoder().encode(`leafy-storage:v1:${name}`)
 
+function afterPendingWrite(name: string) {
+  return pendingWrites.get(name)?.catch(() => undefined) ?? Promise.resolve()
+}
+
+function enqueueWrite(name: string, operation: () => Promise<void> | void) {
+  const queued = afterPendingWrite(name).then(operation)
+  pendingWrites.set(name, queued)
+  return queued.finally(() => {
+    if (pendingWrites.get(name) === queued) pendingWrites.delete(name)
+  })
+}
+
 export async function secureGet<T>(name: string): Promise<T | null> {
+  await afterPendingWrite(name)
   const sealed = localStorage.getItem(`leafy-secure:${name}`)
   if (!sealed) return null
   const [iv, ciphertext] = sealed.split('.')
@@ -62,16 +76,18 @@ export async function secureGet<T>(name: string): Promise<T | null> {
 }
 
 export async function secureSet(name: string, value: unknown) {
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const plaintext = new TextEncoder().encode(JSON.stringify(value))
-  const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv, additionalData: additionalData(name) },
-    await deviceKey(),
-    plaintext,
-  ))
-  localStorage.setItem(`leafy-secure:${name}`, `${encode(iv)}.${encode(ciphertext)}`)
+  return enqueueWrite(name, async () => {
+    const iv = crypto.getRandomValues(new Uint8Array(12))
+    const plaintext = new TextEncoder().encode(JSON.stringify(value))
+    const ciphertext = new Uint8Array(await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv, additionalData: additionalData(name) },
+      await deviceKey(),
+      plaintext,
+    ))
+    localStorage.setItem(`leafy-secure:${name}`, `${encode(iv)}.${encode(ciphertext)}`)
+  })
 }
 
-export function secureRemove(name: string) {
-  localStorage.removeItem(`leafy-secure:${name}`)
+export async function secureRemove(name: string) {
+  return enqueueWrite(name, () => localStorage.removeItem(`leafy-secure:${name}`))
 }

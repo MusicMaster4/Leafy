@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { decryptSnapshot, encryptSnapshot, parsePairing, serializePairing, type LedgerSnapshot, type PairingDetails } from './sync'
+import { decryptSnapshot, encryptSnapshot, mergeSnapshots, parsePairing, serializePairing, snapshotEquals, type LedgerSnapshot, type PairingDetails } from './sync'
 import type { RecurringExpense, Transaction } from './types'
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
@@ -83,5 +83,62 @@ describe('pairing QR payload', () => {
   it('still accepts QR codes from earlier version 2 desktop builds', () => {
     const legacy = `leafy://pair?data=${encode(new TextEncoder().encode(JSON.stringify(pairing)))}`
     expect(parsePairing(legacy)).toEqual({ ...pairing, role: 'mirror' })
+  })
+
+  it('never puts the resumable TLS private key in the QR code', () => {
+    const code = serializePairing({ ...pairing, serverKey: 'host-private-key' })
+    expect(code).not.toContain('host-private-key')
+    expect(parsePairing(code).serverKey).toBeUndefined()
+  })
+
+  it('puts only a temporary invitation token in new permanent-pairing codes', () => {
+    const pairingToken = encode(new Uint8Array(32).fill(5))
+    const permanent = { ...pairing, version: 3 as const, pairingToken, serverKey: 'host-private-key' }
+    const code = serializePairing(permanent)
+    expect(code).not.toContain(encode(new Uint8Array(32).fill(1)))
+    expect(parsePairing(code)).toEqual({
+      ...pairing,
+      version: 3,
+      token: pairingToken,
+      role: 'mirror',
+    })
+  })
+})
+
+describe('three-way ledger merge', () => {
+  const extra = (id: string, description: string): Transaction => ({
+    id,
+    type: 'expense',
+    amount: 10,
+    description,
+    category: 'Other',
+    date: '2026-08-28',
+  })
+
+  it('keeps independent offline additions from both devices', () => {
+    const local = { ...snapshot, transactions: [...snapshot.transactions, extra('local', 'From phone')] }
+    const remote = { ...snapshot, transactions: [...snapshot.transactions, extra('remote', 'From computer')] }
+    const merged = mergeSnapshots(snapshot, local, remote)
+    expect(merged.transactions.map(row => row.id)).toEqual(['local', 'remote', 'secure-test-row'])
+  })
+
+  it('propagates a deletion when the other device did not edit that record', () => {
+    const local = { ...snapshot, transactions: [] }
+    expect(mergeSnapshots(snapshot, local, snapshot).transactions).toEqual([])
+  })
+
+  it('does not lose an edit that happened concurrently with a deletion', () => {
+    const local = { ...snapshot, transactions: [] }
+    const edited = { ...rows[0], category: 'Leisure' }
+    const remote = { ...snapshot, transactions: [edited] }
+    expect(mergeSnapshots(snapshot, local, remote).transactions).toEqual([edited])
+  })
+
+  it('compares snapshots independently of array order', () => {
+    const another = extra('another', 'Another row')
+    expect(snapshotEquals(
+      { ...snapshot, transactions: [rows[0], another] },
+      { ...snapshot, transactions: [another, rows[0]] },
+    )).toBe(true)
   })
 })

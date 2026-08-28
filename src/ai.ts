@@ -48,7 +48,7 @@ export async function configureOpenRouter(key: string, persist = true) {
   await invoke<void>('set_openrouter_key', { key: trimmed })
   if (persist) {
     if (trimmed) await secureSet('openrouter-key', trimmed)
-    else secureRemove('openrouter-key')
+    else await secureRemove('openrouter-key')
   }
 }
 

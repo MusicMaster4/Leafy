@@ -4,15 +4,20 @@ import { isCurrencyCode, type CurrencyCode, type RecurringExpense, type Transact
 import { secureGet, secureRemove, secureSet } from './storage'
 
 export type PairingDetails = {
-  version: 2
+  version: 2 | 3
   endpoint: string
+  /** Durable request credential after pairing; a one-hour invitation before it. */
   token: string
+  /** Host-only invitation credential. It is the only token placed in a v3 QR code. */
+  pairingToken?: string
   key: string
   certificate: string
   sessionId: string
   expiresAt: string
   deviceName: string
   networkMode?: 'tailscale' | 'local'
+  /** Stored only on the host. It is deliberately never serialized into the QR code. */
+  serverKey?: string
   role: 'host' | 'mirror'
 }
 
@@ -26,6 +31,16 @@ type SyncEnvelope = LedgerSnapshot & {
   version: 2
   sessionId: string
   updatedAt: string
+}
+
+export type RemoteLedgerSnapshot = {
+  snapshot: LedgerSnapshot
+  revision: number
+}
+
+type SyncCheckpoint = {
+  sessionId: string
+  snapshot: LedgerSnapshot
 }
 
 function isTransaction(value: unknown): value is Transaction {
@@ -53,6 +68,14 @@ function isRecurringExpense(value: unknown): value is RecurringExpense {
     && typeof rule.dayOfMonth === 'number' && Number.isInteger(rule.dayOfMonth) && rule.dayOfMonth >= 1 && rule.dayOfMonth <= 31
     && validDate(rule.startDate)
     && (rule.lastGeneratedDate === undefined || validDate(rule.lastGeneratedDate))
+}
+
+function isLedgerSnapshot(value: unknown): value is LedgerSnapshot {
+  if (!value || typeof value !== 'object') return false
+  const snapshot = value as Partial<LedgerSnapshot>
+  return Array.isArray(snapshot.transactions) && snapshot.transactions.every(isTransaction)
+    && Array.isArray(snapshot.recurringExpenses) && snapshot.recurringExpenses.every(isRecurringExpense)
+    && isCurrencyCode(snapshot.currency)
 }
 
 const encode = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/, '')
@@ -90,19 +113,22 @@ export async function decryptSnapshot(payload: string, key: string, sessionId: s
 export async function createPairing(snapshot: LedgerSnapshot): Promise<PairingDetails> {
   const key = encode(crypto.getRandomValues(new Uint8Array(32)))
   const token = encode(crypto.getRandomValues(new Uint8Array(32)))
+  const pairingToken = encode(crypto.getRandomValues(new Uint8Array(32)))
   const sessionId = encode(crypto.getRandomValues(new Uint8Array(16)))
   const payload = await encryptSnapshot(snapshot, key, sessionId)
-  const { endpoint, certificate, networkMode } = await invoke<{ endpoint: string; certificate: string; networkMode: 'tailscale' | 'local' }>('start_pairing_server', { token, payload })
+  const { endpoint, certificate, serverKey, networkMode } = await invoke<{ endpoint: string; certificate: string; serverKey: string; networkMode: 'tailscale' | 'local' }>('start_pairing_server', { token, pairingToken, pairingTtlSeconds: 60 * 60, payload })
   return {
-    version: 2,
+    version: 3,
     endpoint,
     token,
+    pairingToken,
     key,
     certificate,
     sessionId,
     expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     deviceName: 'Leafy Desktop',
     networkMode,
+    serverKey,
     role: 'host',
   }
 }
@@ -111,7 +137,7 @@ export function serializePairing(details: PairingDetails) {
   const query = new URLSearchParams({
     v: String(details.version),
     e: details.endpoint,
-    t: details.token,
+    t: details.version === 3 ? details.pairingToken ?? '' : details.token,
     k: details.key,
     c: details.certificate,
     s: details.sessionId,
@@ -140,7 +166,7 @@ export function parsePairing(value: string): PairingDetails {
         deviceName: url.searchParams.get('d') ?? 'Leafy Desktop',
         ...(url.searchParams.has('n') ? { networkMode: url.searchParams.get('n') === 'tailscale' ? 'tailscale' as const : 'local' as const } : {}),
       } as PairingDetails
-  if (details.version !== 2 || !details.endpoint || !details.token || !details.key || !details.certificate || !details.sessionId) throw new Error('Unsupported pairing code')
+  if (![2, 3].includes(details.version) || !details.endpoint || !details.token || !details.key || !details.certificate || !details.sessionId) throw new Error('Unsupported pairing code')
   if (decode(details.token).length !== 32 || decode(details.key).length !== 32 || decode(details.sessionId).length !== 16) throw new Error('Invalid pairing secrets')
   if (!details.expiresAt || Date.parse(details.expiresAt) <= Date.now()) throw new Error('This pairing code has expired')
   return { ...details, role: 'mirror' }
@@ -158,41 +184,159 @@ export async function scanPairingCode() {
 export async function savedPeer(): Promise<PairingDetails | null> {
   try {
     const peer = await secureGet<PairingDetails>('peer')
-    if (!peer || peer.version !== 2 || !['host', 'mirror'].includes(peer.role) || Date.parse(peer.expiresAt) <= Date.now()) {
-      secureRemove('peer')
+    // expiresAt limits use of the QR code, not the lifetime of an established
+    // connection. Legacy host records have no private TLS key and cannot be
+    // resumed after the desktop process exits, so they must be paired once
+    // more after upgrading.
+    if (!peer
+      || ![2, 3].includes(peer.version)
+      || !['host', 'mirror'].includes(peer.role)
+      || peer.version === 2 && Date.parse(peer.expiresAt) <= Date.now()
+      || peer.role === 'host' && (!peer.serverKey || peer.version === 3 && !peer.pairingToken)) {
+      await Promise.all([secureRemove('peer'), secureRemove('sync-checkpoint')])
       return null
     }
     return peer
   } catch { return null }
 }
 
-export async function pullFromPeer(peer: PairingDetails) {
-  const payload = await invoke<string>('sync_download', {
+export async function completePairing(peer: PairingDetails): Promise<PairingDetails> {
+  if (peer.version === 2) return peer
+  const token = await invoke<string>('complete_pairing', {
     endpoint: peer.endpoint,
     certificate: peer.certificate,
     token: peer.token,
   })
-  return decryptSnapshot(payload, peer.key, peer.sessionId)
+  if (decode(token).length !== 32) throw new Error('The computer returned an invalid device credential')
+  return { ...peer, token }
 }
 
-export async function pullHostedSnapshot(peer: PairingDetails) {
+async function decodeRemote(remote: { payload: string; revision: number }, peer: PairingDetails): Promise<RemoteLedgerSnapshot> {
+  if (!Number.isSafeInteger(remote.revision) || remote.revision < 0) throw new Error('Private sync returned an invalid revision')
+  return { snapshot: await decryptSnapshot(remote.payload, peer.key, peer.sessionId), revision: remote.revision }
+}
+
+export async function pullFromPeer(peer: PairingDetails): Promise<RemoteLedgerSnapshot> {
+  const remote = await invoke<{ payload: string; revision: number }>('sync_download', {
+    endpoint: peer.endpoint,
+    certificate: peer.certificate,
+    token: peer.token,
+  })
+  return decodeRemote(remote, peer)
+}
+
+export async function pullHostedSnapshot(peer: PairingDetails): Promise<RemoteLedgerSnapshot> {
   if (peer.role !== 'host') throw new Error('Only the computer can read its shared ledger')
-  const payload = await invoke<string>('read_hosted_sync_snapshot')
-  return decryptSnapshot(payload, peer.key, peer.sessionId)
+  return decodeRemote(await invoke<{ payload: string; revision: number }>('read_hosted_sync_snapshot'), peer)
 }
 
-export async function publishSnapshot(peer: PairingDetails, snapshot: LedgerSnapshot) {
+export async function publishSnapshot(peer: PairingDetails, snapshot: LedgerSnapshot, expectedRevision: number) {
   const payload = await encryptSnapshot(snapshot, peer.key, peer.sessionId)
   if (peer.role === 'host') {
-    await invoke<void>('publish_sync_snapshot', { payload })
-    return
+    return invoke<number>('publish_sync_snapshot', { payload, expectedRevision })
   }
-  await invoke<void>('sync_upload', {
+  return invoke<number>('sync_upload', {
     endpoint: peer.endpoint,
     certificate: peer.certificate,
     token: peer.token,
     payload,
+    expectedRevision,
   })
+}
+
+export async function resumeHostedSync(peer: PairingDetails, snapshot: LedgerSnapshot) {
+  if (peer.role !== 'host' || !peer.serverKey) throw new Error('Pair this computer again to resume private sync')
+  await invoke<void>('resume_pairing_server', {
+    endpoint: peer.endpoint,
+    token: peer.token,
+    pairingToken: peer.pairingToken ?? peer.token,
+    pairingTtlSeconds: Math.max(0, Math.ceil((Date.parse(peer.expiresAt) - Date.now()) / 1000)),
+    certificate: peer.certificate,
+    serverKey: peer.serverKey,
+    payload: await encryptSnapshot(snapshot, peer.key, peer.sessionId),
+  })
+}
+
+function stableRecord<T extends { id: string }>(value: T | undefined) {
+  return value === undefined ? '' : JSON.stringify(value)
+}
+
+function mergeRecords<T extends { id: string }>(baseRows: T[], localRows: T[], remoteRows: T[]) {
+  const base = new Map(baseRows.map(row => [row.id, row]))
+  const local = new Map(localRows.map(row => [row.id, row]))
+  const remote = new Map(remoteRows.map(row => [row.id, row]))
+  const ids = new Set([...base.keys(), ...local.keys(), ...remote.keys()])
+  const merged: T[] = []
+  for (const id of ids) {
+    const original = base.get(id)
+    const left = local.get(id)
+    const right = remote.get(id)
+    const originalKey = stableRecord(original)
+    const leftKey = stableRecord(left)
+    const rightKey = stableRecord(right)
+    let selected: T | undefined
+    if (leftKey === rightKey) selected = left
+    else if (leftKey === originalKey) selected = right
+    else if (rightKey === originalKey) selected = left
+    // An edit concurrent with a deletion keeps the edited record. For two
+    // concurrent edits, a stable comparison makes every device converge.
+    else if (!left) selected = right
+    else if (!right) selected = left
+    else selected = leftKey > rightKey ? left : right
+    if (selected) merged.push(selected)
+  }
+  return merged.sort((left, right) => left.id.localeCompare(right.id))
+}
+
+export function canonicalSnapshot(snapshot: LedgerSnapshot): LedgerSnapshot {
+  return {
+    transactions: [...snapshot.transactions].sort((left, right) => left.id.localeCompare(right.id)),
+    recurringExpenses: [...snapshot.recurringExpenses].sort((left, right) => left.id.localeCompare(right.id)),
+    currency: snapshot.currency,
+  }
+}
+
+export function snapshotEquals(left: LedgerSnapshot, right: LedgerSnapshot) {
+  return JSON.stringify(canonicalSnapshot(left)) === JSON.stringify(canonicalSnapshot(right))
+}
+
+export function mergeSnapshots(base: LedgerSnapshot | null, local: LedgerSnapshot, remote: LedgerSnapshot): LedgerSnapshot {
+  const original = base ?? { transactions: [], recurringExpenses: [], currency: 'BRL' as const }
+  const currency = local.currency === remote.currency
+    ? local.currency
+    : local.currency === original.currency
+      ? remote.currency
+      : remote.currency === original.currency
+        ? local.currency
+        : local.currency > remote.currency ? local.currency : remote.currency
+  return {
+    transactions: mergeRecords(original.transactions, local.transactions, remote.transactions),
+    recurringExpenses: mergeRecords(original.recurringExpenses, local.recurringExpenses, remote.recurringExpenses),
+    currency,
+  }
+}
+
+export async function savedSyncCheckpoint(peer: PairingDetails) {
+  try {
+    const checkpoint = await secureGet<SyncCheckpoint>('sync-checkpoint')
+    return checkpoint?.sessionId === peer.sessionId && isLedgerSnapshot(checkpoint.snapshot)
+      ? canonicalSnapshot(checkpoint.snapshot)
+      : null
+  } catch { return null }
+}
+
+export async function rememberSyncCheckpoint(peer: PairingDetails, snapshot: LedgerSnapshot) {
+  const canonical = canonicalSnapshot(snapshot)
+  // Persist the ledger before advancing its common sync checkpoint. If the
+  // process is stopped between these writes, the next launch sees an older
+  // checkpoint and safely retries the merge instead of mistaking stale local
+  // storage for a new deletion.
+  await Promise.all([
+    secureSet('transactions', canonical.transactions),
+    secureSet('recurring-expenses', canonical.recurringExpenses),
+    secureSet('currency', canonical.currency),
+  ])
+  await secureSet('sync-checkpoint', { sessionId: peer.sessionId, snapshot: canonical } satisfies SyncCheckpoint)
 }
 
 export async function rememberPeer(peer: PairingDetails) {
@@ -200,7 +344,11 @@ export async function rememberPeer(peer: PairingDetails) {
   localStorage.removeItem('leafy-peer')
 }
 
-export function forgetPeer() {
-  secureRemove('peer')
+export async function forgetPeer() {
+  await Promise.allSettled([
+    invoke<void>('stop_pairing_server'),
+    secureRemove('peer'),
+    secureRemove('sync-checkpoint'),
+  ])
   localStorage.removeItem('leafy-peer')
 }

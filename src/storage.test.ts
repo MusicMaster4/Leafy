@@ -38,7 +38,16 @@ describe('encrypted local storage', () => {
 
   it('removes encrypted records', async () => {
     await secureSet('peer', { token: 'fictional' })
-    secureRemove('peer')
+    await secureRemove('peer')
     await expect(secureGet('peer')).resolves.toBeNull()
+  })
+
+  it('serializes rapid writes so the newest value always wins', async () => {
+    await Promise.all([
+      secureSet('transactions', { revision: 1 }),
+      secureSet('transactions', { revision: 2 }),
+      secureSet('transactions', { revision: 3 }),
+    ])
+    await expect(secureGet('transactions')).resolves.toEqual({ revision: 3 })
   })
 })

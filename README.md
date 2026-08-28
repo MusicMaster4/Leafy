@@ -14,7 +14,7 @@
 
 Leafy is a local-first personal finance tracker for desktop and Android. Recording an expense takes an amount, a short description, and one click. The dashboard handles the totals, trends, and category breakdown.
 
-There is no Leafy account or hosted ledger. Transactions and preferences stay on your device, sealed with AES-256-GCM. Pairing a phone with a computer creates a short-lived, certificate-pinned connection with separate keys for authentication and content encryption.
+There is no Leafy account or hosted ledger. Transactions and preferences stay on your device, sealed with AES-256-GCM. Pairing a phone with a computer creates a persistent, certificate-pinned connection with separate keys for authentication and content encryption. The QR invitation itself expires after one hour.
 
 ## What Leafy can do
 
@@ -96,15 +96,15 @@ Incoming files are limited to 10 MB and 10 PDF pages. Leafy accepts Android `con
 
 ## Private device sync
 
-The desktop app opens a one-hour HTTPS endpoint on a random port. It prefers Tailscale and falls back to the local network. The phone uses only the self-signed certificate carried by the QR code as its TLS trust store, so the certificate is pinned without disabling verification.
+The desktop app opens an HTTPS endpoint on a random port. It prefers Tailscale and falls back to the local network. The phone uses only the self-signed certificate carried by the QR code as its TLS trust store, so the certificate is pinned without disabling verification. Closing the paired desktop window keeps this endpoint running in the background; if the process or computer stops, Leafy restores the same endpoint and TLS identity when it starts again.
 
-While paired, the phone and computer share one ledger. Transactions, recurring expenses, deletions, and the display currency sync in both directions every second. Each device keeps its last encrypted local copy if the other briefly goes offline and resumes syncing when the private connection returns.
+While paired, the phone and computer share one ledger. Transactions, recurring expenses, deletions, and the display currency sync in both directions every second. Each device keeps its encrypted local copy and a sealed checkpoint of the last common ledger. A three-way merge preserves independent offline edits, while revision-checked uploads prevent simultaneous writes from silently replacing one another.
 
 The QR code contains:
 
 - a 256-bit AES-GCM key that encrypts financial data before it leaves the device
-- a separate 256-bit bearer token compared in constant time
-- the temporary TLS certificate and a random session identifier
+- a one-hour 256-bit invitation token exchanged over pinned TLS for a separate durable device credential
+- the pinned TLS certificate and a random session identifier
 
 The native client accepts only `https://` endpoints on local/private addresses or Tailscale's `100.64.0.0/10` range. It rejects redirects, proxies, and public hosts, limits payload size, and binds ciphertext to its session with authenticated additional data. The desktop endpoint accepts uploads only from a paired device presenting the session token, and the ledger remains encrypted end to end.
 
@@ -140,7 +140,7 @@ scripts/                Icons, validation, firewall setup, and release versionin
 
 ## Privacy and security
 
-Leafy does not connect to banks or upload a ledger to a Leafy service. OpenRouter receives only descriptions submitted with `Auto` selected. Someone who can unlock or fully compromise your device can still read data available to the app. Anyone who photographs an active pairing QR can join that time-limited session, so treat it like a password and disconnect when you are done.
+Leafy does not connect to banks or upload a ledger to a Leafy service. OpenRouter receives only descriptions submitted with `Auto` selected. Someone who can unlock or fully compromise your device can still read data available to the app. Anyone who captures and uses a pairing QR during its one-hour validity can remain paired, so treat it like a password and use **Disconnect this device** to revoke the connection.
 
 Read [SECURITY.md](SECURITY.md) for the threat model and private reporting process.
 
