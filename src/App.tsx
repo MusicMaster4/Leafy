@@ -7,12 +7,12 @@ import {
 } from 'lucide-react'
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer,
-  Tooltip, XAxis, YAxis,
+  Line, LineChart, ReferenceLine, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import { QRCodeSVG } from 'qrcode.react'
 import { format, parseISO } from 'date-fns'
 import { enUS } from 'date-fns/locale'
-import { categorySeries, dailySeries, lastDays, money, parseAmount, summarize } from './finance'
+import { balanceZeroOffset, categorySeries, cumulativeBalanceSeries, dailySeries, lastDays, money, parseAmount, summarize } from './finance'
 import { demoTransactions } from './data'
 import {
   currencies, currencyDetails, expenseCategories, incomeCategories, isCurrencyCode,
@@ -340,6 +340,13 @@ function SyncPanel({ snapshot, initialPeer, onClose, onPaired, onSnapshot }: {
   </div>
 }
 
+function BalanceTooltip({ active, payload, label }: any) {
+  const currency = useCurrency()
+  if (!active || !payload?.length || !label) return null
+  const value = Number(payload[0].value)
+  return <div className="chart-tooltip"><b>{format(parseISO(label), 'MMM d, yyyy', { locale: enUS })}</b><span style={{ color: value >= 0 ? '#b8d96f' : '#ef8a71' }}>Balance: {money(value, false, currency)}</span></div>
+}
+
 function nextConnectionHint(details: PairingDetails | undefined, pairingText: string, message: string) {
   let connection = details
   if (!connection && pairingText.trim()) {
@@ -383,6 +390,8 @@ export default function App() {
   const summary = useMemo(() => summarize(periodRows), [periodRows])
   const allSummary = useMemo(() => summarize(transactions), [transactions])
   const chart = useMemo(() => dailySeries(periodRows, days), [periodRows, days])
+  const balanceChart = useMemo(() => cumulativeBalanceSeries(transactions), [transactions])
+  const zeroOffset = useMemo(() => balanceZeroOffset(balanceChart), [balanceChart])
   const categories = useMemo(() => categorySeries(periodRows), [periodRows])
   const weekSpend = summarize(lastDays(transactions, 7)).expenses
   const greeting = new Date().getHours() < 12 ? 'Good morning' : new Date().getHours() < 18 ? 'Good afternoon' : 'Good evening'
@@ -706,6 +715,24 @@ export default function App() {
           <button className="mobile-add-button" onClick={() => setEntryOpen(true)} aria-label="Add transaction"><Plus size={21} /><span>Add</span></button>
 
         <section className="charts-grid dashboard-anchor" ref={insightsRef}>
+          <article className="panel balance-panel">
+            <div className="panel-head"><div><span className="eyebrow">All-time balance</span><h2>Balance over time</h2></div><span className="legend"><i className="income-dot" />Above zero <i className="expense-dot" />Below zero</span></div>
+            {balanceChart.length ? <div className="chart-wrap balance-chart-wrap" role="img" aria-label={`All-time balance chart. Current balance is ${money(allSummary.balance, false, currency)}.`}>
+              <ResponsiveContainer width="100%" height="100%"><LineChart data={balanceChart} margin={{ left: -8, right: 14, top: 12, bottom: 2 }}>
+                <defs><linearGradient id="balanceStroke" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset={`${zeroOffset}%`} stopColor="#b8d96f" />
+                  <stop offset={`${zeroOffset}%`} stopColor="#ef8a71" />
+                </linearGradient></defs>
+                <CartesianGrid vertical={false} stroke="#272b29" />
+                <XAxis dataKey="date" tickFormatter={value => format(parseISO(value), balanceChart.length > 12 ? 'MMM yy' : 'MMM d', { locale: enUS })} tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={42} />
+                <YAxis domain={[dataMin => Math.min(0, dataMin), dataMax => Math.max(0, dataMax)]} tickFormatter={value => money(value, true, currency)} tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} width={64} />
+                <ReferenceLine y={0} stroke="#59605a" strokeDasharray="4 4" />
+                <Tooltip content={<BalanceTooltip />} />
+                <Line type="monotone" dataKey="balance" name="Balance" stroke="url(#balanceStroke)" strokeWidth={2.5} dot={balanceChart.length === 1} activeDot={{ r: 4, strokeWidth: 3, stroke: '#111412' }} />
+              </LineChart></ResponsiveContainer>
+            </div> : <div className="empty-chart balance-empty">Add a transaction to start your balance history</div>}
+          </article>
+
           <article className="panel flow-panel">
             <div className="panel-head"><div><span className="eyebrow">Cash flow</span><h2>Income and expenses</h2></div><span className="legend"><i className="income-dot" />Income <i className="expense-dot" />Expenses</span></div>
             <div className="chart-wrap">

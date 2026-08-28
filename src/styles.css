@@ -96,6 +96,7 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
 .balance-toggle:hover { color: #cbd0ca; }
 
 .charts-grid { display: grid; grid-template-columns: minmax(0, 1.85fr) minmax(250px, .8fr); gap: 12px; }
+.balance-panel { grid-column: 1 / -1; }
 .lower-grid { margin-top: 12px; display: grid; grid-template-columns: minmax(0, 1.55fr) minmax(280px, .75fr); gap: 12px; }
 .panel { min-width: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 7px; background: var(--paper); }
 .panel-head { min-height: 68px; padding: 17px 19px 10px; display: flex; align-items: center; justify-content: space-between; gap: 14px; }
@@ -106,6 +107,7 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
 .legend i.expense-dot { margin-left: 7px; background: var(--orange); }
 .legend i.income-dot { background: var(--green); }
 .chart-wrap { height: 258px; padding: 2px 13px 13px; }
+.balance-chart-wrap { height: 238px; }
 .chart-tooltip { padding: 9px 11px; display: grid; gap: 3px; border: 1px solid var(--line-strong); border-radius: 4px; background: #0d100e; box-shadow: 0 10px 30px #0008; color: white; font-size: 10px; }
 .chart-tooltip b { margin-bottom: 2px; color: #a9afa9; font-weight: 550; }
 .donut-wrap { position: relative; height: 176px; }
@@ -117,6 +119,7 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
 .category-list span { display: flex; align-items: center; gap: 8px; color: #858c85; }
 .category-list b { color: #c5cbc4; font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .empty-chart { height: 235px; display: grid; place-items: center; color: #737a74; font-size: 11px; }
+.balance-empty { height: 190px; }
 
 .search { width: 145px; min-height: 32px; padding: 6px 9px; display: flex; align-items: center; gap: 7px; border-bottom: 1px solid var(--line-strong); color: #767e77; }
 .search:focus-within { border-color: var(--green); }
@@ -311,6 +314,7 @@ kbd { margin-left: 3px; padding: 2px 5px; border: 1px solid #7d943f; border-radi
   .panel { border-radius: 6px; }
   .panel-head { padding-inline: 16px; }
   .chart-wrap { height: 250px; padding-inline: 4px; }
+  .balance-chart-wrap { height: 220px; }
   .category-panel .panel-head { min-height: 62px; }
   .delete-button { width: 44px; height: 44px; opacity: 1; color: #7f867f; }
   .modal-backdrop { padding: 0; align-items: end; }
