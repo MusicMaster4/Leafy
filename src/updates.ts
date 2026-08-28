@@ -75,9 +75,16 @@ const checkAndroidUpdates = () => new Promise<UpdateCheck>((resolve, reject) => 
   }
 })
 
-export const checkForUpdates = () => typeof window.LeafyAndroid?.checkForUpdates === 'function'
-  ? checkAndroidUpdates()
-  : withTimeout(invoke<UpdateCheck>('check_for_updates'))
+const isAndroidRuntime = () => /Android/i.test(window.navigator.userAgent)
+
+export const checkForUpdates = () => {
+  if (typeof window.LeafyAndroid?.checkForUpdates === 'function') return checkAndroidUpdates()
+  // The Rust updater command is desktop-only. Calling it from an Android
+  // WebView when the native bridge failed to load was the original path that
+  // could leave the button checking indefinitely.
+  if (isAndroidRuntime()) return Promise.reject(new Error('Android update checker is unavailable'))
+  return withTimeout(invoke<UpdateCheck>('check_for_updates'))
+}
 export const canInstallAndroidUpdate = () => typeof window.LeafyAndroid?.installUpdate === 'function'
 export const installAndroidUpdate = (apkUrl: string) => {
   if (!window.LeafyAndroid) throw new Error('Android installer is unavailable')

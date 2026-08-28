@@ -179,9 +179,9 @@ class MainActivity : TauriActivity() {
         .put("available", latest > current)
         .put("apkUrl", apkUrl ?: JSONObject.NULL)
         .put("updaterUrl", "https://github.com/MusicMaster4/Leafy/releases/download/$tag/latest.json")
-      queueEvent("leafy:update-check-result", payload)
+      emitWebEvent("leafy:update-check-result", payload)
     } catch (_: Exception) {
-      queueEvent("leafy:update-check-error", JSONObject().put("message", "Could not reach GitHub Releases."))
+      emitWebEvent("leafy:update-check-error", JSONObject().put("message", "Could not reach GitHub Releases."))
     } finally {
       connection?.disconnect()
     }
@@ -277,15 +277,15 @@ class MainActivity : TauriActivity() {
   }
 
   private fun emitUpdateProgress(percent: Int) {
-    queueEvent("leafy:update-progress", JSONObject().put("percent", percent))
+    emitWebEvent("leafy:update-progress", JSONObject().put("percent", percent))
   }
 
   private fun emitUpdateStatus(status: String) {
-    queueEvent("leafy:update-status", JSONObject().put("status", status))
+    emitWebEvent("leafy:update-status", JSONObject().put("status", status))
   }
 
   private fun emitUpdateError(message: String) {
-    queueEvent("leafy:update-error", JSONObject().put("message", message))
+    emitWebEvent("leafy:update-error", JSONObject().put("message", message))
   }
 
   private fun receiveShareIntent(sharedIntent: Intent?) {
@@ -478,6 +478,21 @@ class MainActivity : TauriActivity() {
     queueEvent("leafy:share-error", JSONObject().put("message", message))
   }
 
+  private fun emitWebEvent(name: String, payload: JSONObject) {
+    val webView = leafyWebView ?: return
+    val quotedName = JSONObject.quote(name)
+    val quotedJson = JSONObject.quote(payload.toString())
+    webView.post {
+      webView.evaluateJavascript(
+        "window.dispatchEvent(new CustomEvent($quotedName,{detail:JSON.parse($quotedJson)}));",
+        null,
+      )
+    }
+  }
+
+  // Shared files can arrive before React mounts, so only those events need the
+  // readiness queue. Update events are initiated by React and are dispatched
+  // directly to the listeners that started the operation.
   private fun queueEvent(name: String, payload: JSONObject) {
     pendingEvent = PendingEvent(name, payload.toString())
     dispatchPendingEvent()
