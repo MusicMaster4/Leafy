@@ -93,7 +93,7 @@ jobs:
           - platform: ubuntu-22.04
             args: --bundles deb,appimage
           - platform: macos-latest
-            args: --bundles dmg
+            args: --bundles app,dmg
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v7
@@ -116,11 +116,15 @@ jobs:
       - uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.LEAFY_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         with:
           tagName: ${{ needs.version.outputs.tag }}
           releaseName: Leafy ${{ needs.version.outputs.tag }}
           releaseDraft: true
           prerelease: ${{ needs.version.outputs.channel == 'testing' }}
+          retryAttempts: 3
+          updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
 
   android:
@@ -151,15 +155,28 @@ jobs:
           rustup target add aarch64-linux-android armv7-linux-androideabi i686-linux-android x86_64-linux-android
       - run: npm ci
       - run: node scripts/apply-version.mjs --version "${{ needs.version.outputs.version }}"
+      - name: Prepare persistent Android signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.LEAFY_ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.LEAFY_ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.LEAFY_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.LEAFY_ANDROID_KEY_PASSWORD }}
+        run: |
+          test -n "$KEYSTORE_BASE64" && test -n "$KEYSTORE_PASSWORD" && test -n "$KEY_ALIAS" && test -n "$KEY_PASSWORD"
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/leafy-release.jks"
+          echo "LEAFY_ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/leafy-release.jks" >> "$GITHUB_ENV"
+          echo "LEAFY_ANDROID_KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD" >> "$GITHUB_ENV"
+          echo "LEAFY_ANDROID_KEY_ALIAS=$KEY_ALIAS" >> "$GITHUB_ENV"
+          echo "LEAFY_ANDROID_KEY_PASSWORD=$KEY_PASSWORD" >> "$GITHUB_ENV"
       - name: Build installable APK
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
-        run: npm run tauri android build -- --debug --apk --target aarch64
+        run: npm run tauri android build -- --apk --target aarch64
       - name: Android lint
         working-directory: src-tauri/gen/android
         run: |
           chmod +x gradlew
-          ./gradlew lintArm64Debug
+          ./gradlew lintArm64Release
       - name: Stage APK
         run: |
           mkdir release-assets

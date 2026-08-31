@@ -1,48 +1,113 @@
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, State as AxumState},
     http::{header::AUTHORIZATION, HeaderMap, Response, StatusCode},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use axum_server::tls_rustls::RustlsConfig;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::{
     net::{IpAddr, TcpListener},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
 use tauri::State;
-use tokio::sync::RwLock;
+#[cfg(desktop)]
+use tauri::{AppHandle, Emitter, Manager};
+#[cfg(desktop)]
+use tauri_plugin_updater::UpdaterExt;
+use tokio::sync::{oneshot, RwLock};
 
 const MAX_SYNC_BYTES: usize = 5_000_000;
-const SYNC_SESSION_SECONDS: u64 = 60 * 60;
+const REVISION_HEADER: &str = "x-leafy-revision";
+const BASE_REVISION_HEADER: &str = "x-leafy-base-revision";
 
 fn ensure_crypto_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
+#[cfg(target_os = "android")]
+#[export_name = "Java_app_leafy_financas_MainActivity_initTlsVerifier"]
+pub extern "C" fn init_android_tls_verifier<'local>(
+    mut env: jni::EnvUnowned<'local>,
+    activity: jni::objects::JObject<'local>,
+) {
+    use jni::errors::ThrowRuntimeExAndDefault;
+    env.with_env(|env| rustls_platform_verifier::android::init_with_env(env, activity))
+        .resolve::<ThrowRuntimeExAndDefault>()
+}
+
 #[derive(Default)]
 struct AppState {
-    openrouter_key: Mutex<Option<String>>,
-    received_sync: Arc<Mutex<Option<String>>>,
+    openrouter_key: Arc<Mutex<Option<String>>>,
+    hosted_sync: Arc<Mutex<Option<Arc<RwLock<SyncDocument>>>>>,
+    active_sync: Arc<Mutex<Option<ActiveSyncServer>>>,
 }
 
 #[derive(Clone)]
 struct SyncServerState {
     token: [u8; 32],
+    pairing: Arc<Mutex<Option<PairingInvitation>>>,
+    document: Arc<RwLock<SyncDocument>>,
+    openrouter_key: Arc<Mutex<Option<String>>>,
+}
+
+struct PairingInvitation {
+    token: [u8; 32],
     expires_at: Instant,
-    payload: Arc<RwLock<String>>,
-    received: Arc<Mutex<Option<String>>>,
+}
+
+struct SyncDocument {
+    payload: String,
+    revision: u64,
+}
+
+struct ActiveSyncServer {
+    endpoint: String,
+    token: [u8; 32],
+    certificate: Vec<u8>,
+    running: Arc<AtomicBool>,
+    shutdown: oneshot::Sender<()>,
+}
+
+struct SyncServerIdentity {
+    endpoint: String,
+    token: [u8; 32],
+    pairing_token: [u8; 32],
+    pairing_ttl_seconds: u64,
+    certificate: Vec<u8>,
+    server_key: Vec<u8>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct PairingSession {
     endpoint: String,
     certificate: String,
+    server_key: String,
+    network_mode: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SyncSnapshot {
+    payload: String,
+    revision: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CategorizeRequest {
+    description: String,
+    transaction_type: String,
 }
 
 #[derive(Serialize)]
@@ -74,6 +139,258 @@ struct ChatAnswer {
     content: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateCheck {
+    current_version: String,
+    latest_version: String,
+    available: bool,
+    apk_url: Option<String>,
+    updater_url: String,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Serialize)]
+struct UpdateProgress {
+    percent: u8,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Serialize)]
+struct UpdateStatus<'a> {
+    status: &'a str,
+}
+
+#[cfg(desktop)]
+#[derive(Clone, Serialize)]
+struct UpdateError<'a> {
+    message: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReleaseVersion {
+    core: [u64; 3],
+    testing: Option<u64>,
+}
+
+impl Ord for ReleaseVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.core
+            .cmp(&other.core)
+            .then_with(|| match (self.testing, other.testing) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(&right),
+            })
+    }
+}
+
+impl PartialOrd for ReleaseVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn parse_release_version(version: &str) -> Option<ReleaseVersion> {
+    let version = version.trim().trim_start_matches('v');
+    let (core, suffix) = version
+        .split_once('-')
+        .map_or((version, None), |(core, suffix)| (core, Some(suffix)));
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    let core = [
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+        parts.next()?.ok()?,
+    ];
+    if parts.next().is_some() {
+        return None;
+    }
+    let testing = match suffix {
+        None => None,
+        Some(value) => Some(value.strip_prefix("testing.")?.parse().ok()?),
+    };
+    Some(ReleaseVersion { core, testing })
+}
+
+fn trusted_apk_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url
+                .path()
+                .starts_with("/MusicMaster4/Leafy/releases/download/v")
+            && matches!(
+                url.path().rsplit('/').next(),
+                Some("leafy.apk" | "leafy-beta.apk")
+            )
+    })
+}
+
+#[cfg(any(desktop, test))]
+fn trusted_updater_url(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        let parts = url
+            .path_segments()
+            .map(|segments| segments.collect::<Vec<_>>())
+            .unwrap_or_default();
+        url.scheme() == "https"
+            && url.host_str() == Some("github.com")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && parts.len() == 6
+            && parts[..4] == ["MusicMaster4", "Leafy", "releases", "download"]
+            && parse_release_version(parts[4]).is_some()
+            && parts[5] == "latest.json"
+    })
+}
+
+#[tauri::command]
+async fn check_for_updates() -> Result<UpdateCheck, String> {
+    const MAX_RELEASE_BYTES: usize = 64 * 1024;
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let current =
+        parse_release_version(&current_version).ok_or("The current app version is invalid")?;
+    let testing_channel = current.testing.is_some();
+    let endpoint = if testing_channel {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases?per_page=1"
+    } else {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases/latest"
+    };
+    let response = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(12))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| "Could not prepare the update check")?
+        .get(endpoint)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "Leafy update checker")
+        .send()
+        .await
+        .map_err(|_| "Could not reach GitHub Releases")?;
+    if !response.status().is_success() {
+        return Err(format!("GitHub Releases returned {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RELEASE_BYTES as u64)
+    {
+        return Err("GitHub Releases returned an oversized response".into());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "Could not read the latest release")?;
+    if bytes.len() > MAX_RELEASE_BYTES {
+        return Err("GitHub Releases returned an oversized response".into());
+    }
+    let release: GithubRelease = if testing_channel {
+        serde_json::from_slice::<Vec<GithubRelease>>(&bytes)
+            .map_err(|_| "GitHub Releases returned an invalid response")?
+            .into_iter()
+            .next()
+            .ok_or("GitHub Releases did not return a compatible release")?
+    } else {
+        serde_json::from_slice(&bytes)
+            .map_err(|_| "GitHub Releases returned an invalid response")?
+    };
+    let latest = parse_release_version(&release.tag_name)
+        .ok_or("GitHub Releases did not return a compatible release")?;
+    let apk_url = release
+        .assets
+        .iter()
+        .find(|asset| {
+            matches!(asset.name.as_str(), "leafy.apk" | "leafy-beta.apk")
+                && trusted_apk_url(&asset.browser_download_url)
+        })
+        .map(|asset| asset.browser_download_url.clone());
+    Ok(UpdateCheck {
+        current_version,
+        latest_version: release.tag_name.trim_start_matches('v').to_string(),
+        available: latest > current,
+        apk_url,
+        updater_url: format!(
+            "https://github.com/MusicMaster4/Leafy/releases/download/{}/latest.json",
+            release.tag_name
+        ),
+    })
+}
+
+#[cfg(desktop)]
+#[tauri::command]
+async fn install_desktop_update(updater_url: String, app: AppHandle) -> Result<(), String> {
+    if !trusted_updater_url(&updater_url) {
+        return Err("Leafy refused an untrusted update address".into());
+    }
+    let endpoint = updater_url
+        .parse()
+        .map_err(|_| "The update address is invalid")?;
+    let update = app
+        .updater_builder()
+        .endpoints(vec![endpoint])
+        .map_err(|_| "Could not prepare the updater")?
+        .build()
+        .map_err(|_| "Could not prepare the updater")?
+        .check()
+        .await
+        .map_err(|_| "Could not verify the available update")?
+        .ok_or("The update is no longer available")?;
+
+    let progress_app = app.clone();
+    let installing_app = app.clone();
+    let mut downloaded = 0_u64;
+    update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                downloaded = downloaded.saturating_add(chunk_length as u64);
+                if let Some(total) = content_length.filter(|total| *total > 0) {
+                    let percent = ((downloaded.saturating_mul(100) / total).min(100)) as u8;
+                    let _ = progress_app.emit("leafy:update-progress", UpdateProgress { percent });
+                }
+            },
+            move || {
+                let _ = installing_app.emit(
+                    "leafy:update-status",
+                    UpdateStatus {
+                        status: "installing",
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|_| {
+            let _ = app.emit(
+                "leafy:update-error",
+                UpdateError {
+                    message: "Leafy could not securely install this update.",
+                },
+            );
+            "Could not download or install the update"
+        })?;
+    app.restart();
+}
+
 #[tauri::command]
 fn set_openrouter_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
     let key = key.trim();
@@ -94,6 +411,20 @@ async fn categorize_transaction(
     transaction_type: String,
     state: State<'_, AppState>,
 ) -> Result<String, String> {
+    let key = state
+        .openrouter_key
+        .lock()
+        .map_err(|_| "Could not access the key store")?
+        .clone()
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
+    categorize_with_openrouter(description, transaction_type, key).await
+}
+
+async fn categorize_with_openrouter(
+    description: String,
+    transaction_type: String,
+    key: Option<String>,
+) -> Result<String, String> {
     let description = description.trim();
     if description.is_empty() || description.len() > 200 {
         return Err("Transaction descriptions must be between 1 and 200 characters".into());
@@ -101,13 +432,7 @@ async fn categorize_transaction(
     if transaction_type != "income" && transaction_type != "expense" {
         return Err("Invalid transaction type".into());
     }
-    let key = state
-        .openrouter_key
-        .lock()
-        .map_err(|_| "Could not access the key store")?
-        .clone()
-        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok())
-        .ok_or("OpenRouter is not configured")?;
+    let key = key.ok_or("OpenRouter is not configured")?;
 
     let categories = if transaction_type == "income" {
         "Salary, Freelance, Investments, Gift, Other"
@@ -182,18 +507,16 @@ fn decode_token(value: &str) -> Result<[u8; 32], String> {
         .map_err(|_| "Invalid pairing token".into())
 }
 
-fn is_authorized(headers: &HeaderMap, state: &SyncServerState) -> bool {
-    if Instant::now() >= state.expires_at {
-        return false;
-    }
-    let Some(value) = headers
+fn request_token(headers: &HeaderMap) -> Option<[u8; 32]> {
+    headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-    else {
-        return false;
-    };
-    decode_token(value).is_ok_and(|candidate| bool::from(candidate.ct_eq(&state.token)))
+        .and_then(|value| decode_token(value).ok())
+}
+
+fn is_authorized(headers: &HeaderMap, state: &SyncServerState) -> bool {
+    request_token(headers).is_some_and(|candidate| bool::from(candidate.ct_eq(&state.token)))
 }
 
 fn valid_ciphertext(payload: &str) -> bool {
@@ -212,6 +535,34 @@ fn valid_ciphertext(payload: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
 
+async fn complete_pairing_for_peer(
+    AxumState(state): AxumState<SyncServerState>,
+    headers: HeaderMap,
+) -> Response<Body> {
+    let Some(candidate) = request_token(&headers) else {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::empty())
+            .unwrap();
+    };
+    let authorized = state.pairing.lock().ok().is_some_and(|pairing| {
+        pairing.as_ref().is_some_and(|invitation| {
+            Instant::now() < invitation.expires_at && bool::from(candidate.ct_eq(&invitation.token))
+        })
+    });
+    if !authorized {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::empty())
+            .unwrap();
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Body::from(URL_SAFE_NO_PAD.encode(state.token)))
+        .unwrap()
+}
+
 async fn download_sync(
     AxumState(state): AxumState<SyncServerState>,
     headers: HeaderMap,
@@ -222,18 +573,19 @@ async fn download_sync(
             .body(Body::empty())
             .unwrap();
     }
-    let payload = state.payload.read().await.clone();
+    let document = state.document.read().await;
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/octet-stream")
-        .body(Body::from(payload))
+        .header(REVISION_HEADER, document.revision.to_string())
+        .body(Body::from(document.payload.clone()))
         .unwrap()
 }
 
 async fn upload_sync(
     AxumState(state): AxumState<SyncServerState>,
     headers: HeaderMap,
-    body: String,
+    body: Bytes,
 ) -> Response<Body> {
     if !is_authorized(&headers, &state) {
         return Response::builder()
@@ -241,33 +593,252 @@ async fn upload_sync(
             .body(Body::empty())
             .unwrap();
     }
-    if !valid_ciphertext(&body) {
+    let Ok(payload) = String::from_utf8(body.to_vec()) else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Invalid encrypted sync payload"))
+            .unwrap();
+    };
+    if !valid_ciphertext(&payload) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("Invalid encrypted sync payload"))
+            .unwrap();
+    }
+    let expected_revision = match headers.get(BASE_REVISION_HEADER) {
+        Some(value) => match value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            Some(value) => Some(value),
+            None => {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from("Invalid sync revision"))
+                    .unwrap()
+            }
+        },
+        // Earlier Leafy clients did not send a revision. Accept them during
+        // migration; current clients always use compare-and-swap.
+        None => None,
+    };
+    let mut document = state.document.write().await;
+    if expected_revision.is_some_and(|expected| expected != document.revision) {
+        return Response::builder()
+            .status(StatusCode::CONFLICT)
+            .header(REVISION_HEADER, document.revision.to_string())
+            .body(Body::from("Sync conflict"))
+            .unwrap();
+    }
+    document.payload = payload;
+    document.revision = document.revision.saturating_add(1);
+    Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .header(REVISION_HEADER, document.revision.to_string())
+        .body(Body::empty())
+        .unwrap()
+}
+
+async fn categorize_for_peer(
+    AxumState(state): AxumState<SyncServerState>,
+    headers: HeaderMap,
+    axum::Json(request): axum::Json<CategorizeRequest>,
+) -> Response<Body> {
+    if !is_authorized(&headers, &state) {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
             .body(Body::empty())
             .unwrap();
     }
-    *state.payload.write().await = body.clone();
-    if let Ok(mut received) = state.received.lock() {
-        *received = Some(body);
+    let key = state
+        .openrouter_key
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+        .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
+    match categorize_with_openrouter(request.description, request.transaction_type, key).await {
+        Ok(category) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(Body::from(category))
+            .unwrap(),
+        Err(error) => Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from(error))
+            .unwrap(),
     }
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(Body::empty())
-        .unwrap()
+}
+
+fn is_tailscale_ipv4(value: std::net::Ipv4Addr) -> bool {
+    let octets = value.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
+fn is_pairing_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(value) => {
+            !value.is_loopback() && (value.is_private() || is_tailscale_ipv4(value))
+        }
+        IpAddr::V6(value) => !value.is_loopback() && value.is_unique_local(),
+    }
+}
+
+fn sync_address() -> Result<(IpAddr, bool), String> {
+    if let Ok(interfaces) = local_ip_address::list_afinet_netifas() {
+        if let Some((_, address)) = interfaces.iter().find(|(name, address)| {
+            name.to_ascii_lowercase().contains("tailscale")
+                && match address {
+                    IpAddr::V4(value) => is_tailscale_ipv4(*value),
+                    IpAddr::V6(value) => value.is_unique_local(),
+                }
+        }) {
+            return Ok((*address, true));
+        }
+        // Tailscale IPv4 addresses are globally recognizable even if an OS
+        // localizes or renames the adapter, so prefer them over Wi-Fi/LAN.
+        if let Some((_, address)) = interfaces
+            .iter()
+            .find(|(_, address)| matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(*value)))
+        {
+            return Ok((*address, true));
+        }
+        if let Ok(address) = local_ip_address::local_ip() {
+            if is_pairing_address(address) {
+                let tailscale = matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(value));
+                return Ok((address, tailscale));
+            }
+        }
+        if let Some((_, address)) = interfaces
+            .into_iter()
+            .find(|(_, address)| is_pairing_address(*address))
+        {
+            let tailscale = matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(value));
+            return Ok((address, tailscale));
+        }
+    }
+    local_ip_address::local_ip()
+        .ok()
+        .filter(|address| is_pairing_address(*address))
+        .map(|address| {
+            let tailscale = matches!(address, IpAddr::V4(value) if is_tailscale_ipv4(value));
+            (address, tailscale)
+        })
+        .ok_or_else(|| "Could not find a private local or Tailscale address".into())
+}
+
+fn active_server_matches(
+    state: &AppState,
+    endpoint: &str,
+    token: &[u8; 32],
+    certificate: &[u8],
+) -> Result<bool, String> {
+    let active = state
+        .active_sync
+        .lock()
+        .map_err(|_| "Could not access the private sync server")?;
+    Ok(active.as_ref().is_some_and(|active| {
+        active.running.load(AtomicOrdering::Acquire)
+            && active.endpoint == endpoint
+            && bool::from(active.token.ct_eq(token))
+            && active.certificate == certificate
+    }))
+}
+
+async fn launch_sync_server(
+    identity: SyncServerIdentity,
+    listener: TcpListener,
+    payload: String,
+    state: &AppState,
+) -> Result<(), String> {
+    let tls = RustlsConfig::from_der(vec![identity.certificate.clone()], identity.server_key)
+        .await
+        .map_err(|error| format!("Could not configure private TLS: {error}"))?;
+    let document = Arc::new(RwLock::new(SyncDocument {
+        payload,
+        revision: 0,
+    }));
+    let server_state = SyncServerState {
+        token: identity.token,
+        pairing: Arc::new(Mutex::new((identity.pairing_ttl_seconds > 0).then(|| {
+            PairingInvitation {
+                token: identity.pairing_token,
+                expires_at: Instant::now() + Duration::from_secs(identity.pairing_ttl_seconds),
+            }
+        }))),
+        document: document.clone(),
+        openrouter_key: state.openrouter_key.clone(),
+    };
+    let app = Router::new()
+        .route("/pair", post(complete_pairing_for_peer))
+        .route("/sync", get(download_sync).put(upload_sync))
+        .route("/categorize", post(categorize_for_peer))
+        .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
+        .with_state(server_state);
+    let server = axum_server::from_tcp_rustls(listener, tls)
+        .map_err(|error| format!("Could not start private TLS: {error}"))?;
+    let (shutdown, shutdown_requested) = oneshot::channel();
+    let running = Arc::new(AtomicBool::new(true));
+    {
+        let mut hosted = state
+            .hosted_sync
+            .lock()
+            .map_err(|_| "Could not prepare the shared ledger")?;
+        *hosted = Some(document);
+    }
+    {
+        let mut active = state
+            .active_sync
+            .lock()
+            .map_err(|_| "Could not prepare the private sync server")?;
+        if let Some(previous) = active.take() {
+            let _ = previous.shutdown.send(());
+        }
+        *active = Some(ActiveSyncServer {
+            endpoint: identity.endpoint,
+            token: identity.token,
+            certificate: identity.certificate,
+            running: running.clone(),
+            shutdown,
+        });
+    }
+    tauri::async_runtime::spawn(async move {
+        tokio::select! {
+            _ = server.serve(app.into_make_service()) => {},
+            _ = shutdown_requested => {},
+        }
+        // The listener can end independently of the webview (for example
+        // after a suspend/resume or a transient socket failure). Keeping this
+        // health bit with the registered identity lets the frontend restart
+        // the same pinned server instead of believing a dead listener is
+        // still serving the paired phone.
+        running.store(false, AtomicOrdering::Release);
+    });
+    Ok(())
 }
 
 #[tauri::command]
 async fn start_pairing_server(
     token: String,
+    pairing_token: String,
+    pairing_ttl_seconds: u64,
     payload: String,
     state: State<'_, AppState>,
 ) -> Result<PairingSession, String> {
     let token = decode_token(&token)?;
+    let pairing_token = decode_token(&pairing_token)?;
+    if pairing_ttl_seconds == 0 || pairing_ttl_seconds > 60 * 60 {
+        return Err("Invalid pairing invitation lifetime".into());
+    }
     if !valid_ciphertext(&payload) {
         return Err("Invalid encrypted sync payload".into());
     }
-    let listener = TcpListener::bind("0.0.0.0:0")
+    let (address, tailscale) = sync_address()?;
+    let unspecified = match address {
+        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    };
+    let listener = TcpListener::bind(std::net::SocketAddr::new(unspecified, 0))
         .map_err(|error| format!("Could not start pairing: {error}"))?;
     listener
         .set_nonblocking(true)
@@ -276,36 +847,133 @@ async fn start_pairing_server(
         .local_addr()
         .map_err(|error| error.to_string())?
         .port();
-    let address = local_ip_address::local_ip()
-        .map_err(|error| format!("Could not find a local network address: {error}"))?;
     let CertifiedKey { cert, signing_key } = generate_simple_self_signed(vec![address.to_string()])
         .map_err(|error| format!("Could not create the private TLS session: {error}"))?;
     let certificate = cert.der().to_vec();
-    let tls = RustlsConfig::from_der(vec![certificate.clone()], signing_key.serialize_der())
-        .await
-        .map_err(|error| format!("Could not configure private TLS: {error}"))?;
-    let server_state = SyncServerState {
-        token,
-        expires_at: Instant::now() + Duration::from_secs(SYNC_SESSION_SECONDS),
-        payload: Arc::new(RwLock::new(payload)),
-        received: state.received_sync.clone(),
-    };
-    let app = Router::new()
-        .route("/sync", get(download_sync).put(upload_sync))
-        .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
-        .with_state(server_state);
-    let server = axum_server::from_tcp_rustls(listener, tls)
-        .map_err(|error| format!("Could not start private TLS: {error}"))?;
-    tauri::async_runtime::spawn(async move {
-        tokio::select! {
-            _ = server.serve(app.into_make_service()) => {},
-            _ = tokio::time::sleep(Duration::from_secs(SYNC_SESSION_SECONDS)) => {},
-        }
-    });
+    let server_key = signing_key.serialize_der();
+    let endpoint = format!("https://{}/sync", std::net::SocketAddr::new(address, port));
+    launch_sync_server(
+        SyncServerIdentity {
+            endpoint: endpoint.clone(),
+            token,
+            pairing_token,
+            pairing_ttl_seconds,
+            certificate: certificate.clone(),
+            server_key: server_key.clone(),
+        },
+        listener,
+        payload,
+        &state,
+    )
+    .await?;
     Ok(PairingSession {
-        endpoint: format!("https://{}/sync", std::net::SocketAddr::new(address, port)),
+        endpoint,
         certificate: URL_SAFE_NO_PAD.encode(certificate),
+        server_key: URL_SAFE_NO_PAD.encode(server_key),
+        network_mode: if tailscale { "tailscale" } else { "local" },
     })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Flat parameters are the Tauri IPC contract.
+async fn resume_pairing_server(
+    endpoint: String,
+    token: String,
+    pairing_token: String,
+    pairing_ttl_seconds: u64,
+    certificate: String,
+    server_key: String,
+    payload: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let token = decode_token(&token)?;
+    let pairing_token = decode_token(&pairing_token)?;
+    if pairing_ttl_seconds > 60 * 60 {
+        return Err("Invalid pairing invitation lifetime".into());
+    }
+    if !valid_ciphertext(&payload) {
+        return Err("Invalid encrypted sync payload".into());
+    }
+    let certificate = URL_SAFE_NO_PAD
+        .decode(certificate)
+        .map_err(|_| "Invalid pairing certificate")?;
+    let server_key = URL_SAFE_NO_PAD
+        .decode(server_key)
+        .map_err(|_| "Invalid private sync key")?;
+    if certificate.is_empty()
+        || certificate.len() > 4096
+        || server_key.is_empty()
+        || server_key.len() > 4096
+    {
+        return Err("Invalid private sync identity".into());
+    }
+    if active_server_matches(&state, &endpoint, &token, &certificate)? {
+        return Ok(());
+    }
+    let url = private_sync_url(&endpoint)?;
+    let host = url.host_str().ok_or("The sync endpoint has no address")?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let address: IpAddr = host
+        .parse()
+        .map_err(|_| "The sync endpoint must use a private IP address")?;
+    let port = url.port().ok_or("The sync endpoint has no port")?;
+    let unspecified = match address {
+        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+    };
+    let listener = TcpListener::bind(std::net::SocketAddr::new(unspecified, port))
+        .map_err(|error| format!("Could not resume private sync on port {port}: {error}"))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| format!("Could not secure the private sync listener: {error}"))?;
+    launch_sync_server(
+        SyncServerIdentity {
+            endpoint,
+            token,
+            pairing_token,
+            pairing_ttl_seconds,
+            certificate,
+            server_key,
+        },
+        listener,
+        payload,
+        &state,
+    )
+    .await
+}
+
+#[tauri::command]
+fn hosted_sync_server_active(
+    endpoint: String,
+    token: String,
+    certificate: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let token = decode_token(&token)?;
+    let certificate = URL_SAFE_NO_PAD
+        .decode(certificate)
+        .map_err(|_| "Invalid pairing certificate")?;
+    active_server_matches(&state, &endpoint, &token, &certificate)
+}
+
+#[tauri::command]
+fn stop_pairing_server(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(active) = state
+        .active_sync
+        .lock()
+        .map_err(|_| "Could not access the private sync server")?
+        .take()
+    {
+        let _ = active.shutdown.send(());
+    }
+    *state
+        .hosted_sync
+        .lock()
+        .map_err(|_| "Could not access the shared ledger")? = None;
+    Ok(())
 }
 
 fn private_sync_url(endpoint: &str) -> Result<reqwest::Url, String> {
@@ -319,13 +987,23 @@ fn private_sync_url(endpoint: &str) -> Result<reqwest::Url, String> {
     {
         return Err("The sync endpoint is not allowed".into());
     }
-    let address: IpAddr = url
-        .host_str()
-        .ok_or("The sync endpoint has no address")?
+    let host = url.host_str().ok_or("The sync endpoint has no address")?;
+    // URL serialization wraps IPv6 hosts in brackets. Remove only that
+    // syntactic pair before parsing the literal address.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host);
+    let address: IpAddr = host
         .parse()
         .map_err(|_| "The sync endpoint must use a private IP address")?;
     let private = match address {
-        IpAddr::V4(value) => value.is_private() || value.is_link_local() || value.is_loopback(),
+        IpAddr::V4(value) => {
+            value.is_private()
+                || value.is_link_local()
+                || value.is_loopback()
+                || is_tailscale_ipv4(value)
+        }
         IpAddr::V6(value) => {
             value.is_unique_local() || value.is_unicast_link_local() || value.is_loopback()
         }
@@ -335,6 +1013,12 @@ fn private_sync_url(endpoint: &str) -> Result<reqwest::Url, String> {
         .ok_or_else(|| "Leafy only syncs over a private local network".into())
 }
 
+fn private_peer_url(endpoint: &str, path: &str) -> Result<reqwest::Url, String> {
+    let mut url = private_sync_url(endpoint)?;
+    url.set_path(path);
+    Ok(url)
+}
+
 fn private_sync_client(certificate: &str) -> Result<reqwest::Client, String> {
     let der = URL_SAFE_NO_PAD
         .decode(certificate)
@@ -342,12 +1026,25 @@ fn private_sync_client(certificate: &str) -> Result<reqwest::Client, String> {
     if der.is_empty() || der.len() > 4096 {
         return Err("Invalid pairing certificate".into());
     }
-    let certificate =
-        reqwest::Certificate::from_der(&der).map_err(|_| "Invalid pairing certificate")?;
+    // Build the pinned rustls configuration ourselves. In particular, do not
+    // pass this private certificate through reqwest's platform verifier:
+    // Android cannot merge app-provided roots into that verifier and reports
+    // only an opaque `builder error` before the request is sent.
+    ensure_crypto_provider();
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .map_err(|_| "Invalid pairing certificate")?;
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
     reqwest::Client::builder()
-        .add_root_certificate(certificate)
+        // A preconfigured rustls backend keeps the QR certificate as the only
+        // trust anchor on every platform and bypasses Android's system store.
+        .tls_backend_preconfigured(tls)
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(15))
         .build()
@@ -355,11 +1052,41 @@ fn private_sync_client(certificate: &str) -> Result<reqwest::Client, String> {
 }
 
 #[tauri::command]
-async fn sync_download(
+async fn complete_pairing(
     endpoint: String,
     certificate: String,
     token: String,
 ) -> Result<String, String> {
+    let url = private_peer_url(&endpoint, "/pair")?;
+    decode_token(&token)?;
+    let response = private_sync_client(&certificate)?
+        .post(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|error| format!("Private pairing failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Private pairing returned {}", response.status()));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "Could not read the private device credential")?;
+    if bytes.len() > 64 {
+        return Err("The computer returned an invalid device credential".into());
+    }
+    let token = String::from_utf8(bytes.to_vec())
+        .map_err(|_| "The computer returned an invalid device credential")?;
+    decode_token(&token)?;
+    Ok(token)
+}
+
+#[tauri::command]
+async fn sync_download(
+    endpoint: String,
+    certificate: String,
+    token: String,
+) -> Result<SyncSnapshot, String> {
     let url = private_sync_url(&endpoint)?;
     decode_token(&token)?;
     let response = private_sync_client(&certificate)?
@@ -371,6 +1098,15 @@ async fn sync_download(
     if !response.status().is_success() {
         return Err(format!("Private sync returned {}", response.status()));
     }
+    let revision = response
+        .headers()
+        .get(REVISION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        // Version 2 servers released before revision checks did not include
+        // this header. Revision zero keeps a newly updated phone compatible
+        // until the desktop is updated and paired again.
+        .unwrap_or(0);
     if response
         .content_length()
         .is_some_and(|length| length > MAX_SYNC_BYTES as u64)
@@ -384,7 +1120,9 @@ async fn sync_download(
     if bytes.len() > MAX_SYNC_BYTES {
         return Err("Private sync response is too large".into());
     }
-    String::from_utf8(bytes.to_vec()).map_err(|_| "Private sync returned invalid data".into())
+    let payload =
+        String::from_utf8(bytes.to_vec()).map_err(|_| "Private sync returned invalid data")?;
+    Ok(SyncSnapshot { payload, revision })
 }
 
 #[tauri::command]
@@ -393,7 +1131,8 @@ async fn sync_upload(
     certificate: String,
     token: String,
     payload: String,
-) -> Result<(), String> {
+    expected_revision: u64,
+) -> Result<u64, String> {
     let url = private_sync_url(&endpoint)?;
     decode_token(&token)?;
     if !valid_ciphertext(&payload) {
@@ -403,30 +1142,130 @@ async fn sync_upload(
         .put(url)
         .bearer_auth(token)
         .header("content-type", "application/octet-stream")
+        .header(BASE_REVISION_HEADER, expected_revision.to_string())
         .body(payload)
         .send()
         .await
         .map_err(|error| format!("Private sync failed: {error}"))?;
-    response
-        .status()
-        .is_success()
-        .then_some(())
-        .ok_or_else(|| format!("Private sync returned {}", response.status()))
+    if response.status() == StatusCode::CONFLICT {
+        return Err("Sync conflict".into());
+    }
+    if !response.status().is_success() {
+        return Err(format!("Private sync returned {}", response.status()));
+    }
+    let revision = response
+        .headers()
+        .get(REVISION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| expected_revision.saturating_add(1));
+    Ok(revision)
 }
 
 #[tauri::command]
-fn take_sync_update(state: State<'_, AppState>) -> Result<Option<String>, String> {
-    Ok(state
-        .received_sync
+async fn read_hosted_sync_snapshot(state: State<'_, AppState>) -> Result<SyncSnapshot, String> {
+    let hosted = state
+        .hosted_sync
         .lock()
-        .map_err(|_| "Could not access sync updates")?
-        .take())
+        .map_err(|_| "Could not access the shared ledger")?
+        .clone()
+        .ok_or("Create a pairing code before syncing the shared ledger")?;
+    let document = hosted.read().await;
+    Ok(SyncSnapshot {
+        payload: document.payload.clone(),
+        revision: document.revision,
+    })
+}
+
+#[tauri::command]
+async fn publish_sync_snapshot(
+    payload: String,
+    expected_revision: u64,
+    state: State<'_, AppState>,
+) -> Result<u64, String> {
+    if !valid_ciphertext(&payload) {
+        return Err("Invalid encrypted sync payload".into());
+    }
+    let hosted = state
+        .hosted_sync
+        .lock()
+        .map_err(|_| "Could not access the mirrored ledger")?
+        .clone()
+        .ok_or("Create a pairing code before publishing the mirrored ledger")?;
+    let mut document = hosted.write().await;
+    if document.revision != expected_revision {
+        return Err("Sync conflict".into());
+    }
+    document.payload = payload;
+    document.revision = document.revision.saturating_add(1);
+    Ok(document.revision)
+}
+
+#[tauri::command]
+async fn categorize_via_peer(
+    endpoint: String,
+    certificate: String,
+    token: String,
+    description: String,
+    transaction_type: String,
+) -> Result<String, String> {
+    let url = private_peer_url(&endpoint, "/categorize")?;
+    decode_token(&token)?;
+    let response = private_sync_client(&certificate)?
+        .post(url)
+        .bearer_auth(token)
+        .json(&CategorizeRequest {
+            description,
+            transaction_type,
+        })
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach OpenRouter through your computer: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Your computer could not categorize this transaction ({})",
+            response.status()
+        ));
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|_| "Could not read the category from your computer")?;
+    if bytes.len() > 64 {
+        return Err("Your computer returned an invalid category".into());
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| "Your computer returned an invalid category".into())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     ensure_crypto_provider();
     let builder = tauri::Builder::default();
+    #[cfg(desktop)]
+    let builder = builder
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let keep_syncing = window
+                    .state::<AppState>()
+                    .active_sync
+                    .lock()
+                    .map(|active| active.is_some())
+                    .unwrap_or(false);
+                if keep_syncing {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+        })
+        .plugin(tauri_plugin_updater::Builder::new().build());
     #[cfg(mobile)]
     let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
     builder
@@ -435,9 +1274,18 @@ pub fn run() {
             set_openrouter_key,
             categorize_transaction,
             start_pairing_server,
+            resume_pairing_server,
+            hosted_sync_server_active,
+            stop_pairing_server,
+            complete_pairing,
             sync_download,
             sync_upload,
-            take_sync_update
+            read_hosted_sync_snapshot,
+            publish_sync_snapshot,
+            categorize_via_peer,
+            check_for_updates,
+            #[cfg(desktop)]
+            install_desktop_update
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Leafy");
@@ -446,6 +1294,52 @@ pub fn run() {
 #[cfg(test)]
 mod security_tests {
     use super::*;
+
+    #[test]
+    fn parses_release_versions_for_update_comparison() {
+        assert_eq!(parse_release_version("v1.12.3").unwrap().core, [1, 12, 3]);
+        assert!(
+            parse_release_version("0.2.0-testing.4").unwrap()
+                > parse_release_version("0.2.0-testing.3").unwrap()
+        );
+        assert!(
+            parse_release_version("0.2.0").unwrap()
+                > parse_release_version("0.2.0-testing.4").unwrap()
+        );
+        assert!(parse_release_version("1.2").is_none());
+        assert!(parse_release_version("1.10.0").unwrap() > parse_release_version("1.9.9").unwrap());
+        assert!(parse_release_version("0.2.0-beta.4").is_none());
+    }
+
+    #[test]
+    fn accepts_only_official_leafy_updater_manifests() {
+        assert!(trusted_updater_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v0.1.6-testing.6/latest.json"
+        ));
+        assert!(!trusted_updater_url(
+            "https://github.com.evil.test/MusicMaster4/Leafy/releases/download/v9/latest.json"
+        ));
+        assert!(!trusted_updater_url(
+            "https://github.com/other/Leafy/releases/download/v9/latest.json"
+        ));
+        assert!(!trusted_updater_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v9/not-latest.json"
+        ));
+    }
+
+    #[test]
+    fn accepts_only_official_leafy_apk_assets() {
+        assert!(trusted_apk_url("https://github.com/MusicMaster4/Leafy/releases/download/v0.1.6-testing.3/leafy-beta.apk"));
+        assert!(trusted_apk_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v0.1.5/leafy.apk"
+        ));
+        assert!(!trusted_apk_url(
+            "https://github.com/other/Leafy/releases/download/v9/leafy.apk"
+        ));
+        assert!(!trusted_apk_url(
+            "https://github.com/MusicMaster4/Leafy/releases/download/v9/other.apk"
+        ));
+    }
 
     #[test]
     fn accepts_only_well_formed_ciphertext() {
@@ -461,6 +1355,14 @@ mod security_tests {
     fn accepts_only_private_pinned_sync_destinations() {
         assert!(private_sync_url("https://192.168.1.20:49152/sync").is_ok());
         assert!(private_sync_url("https://10.0.0.2:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.64.0.1:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.113.41.57:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.127.255.254:49152/sync").is_ok());
+        assert!(private_sync_url("https://100.63.255.254:49152/sync").is_err());
+        assert!(private_sync_url("https://100.128.0.1:49152/sync").is_err());
+        assert!(private_sync_url("https://[fd7a:115c:a1e0::1234]:49152/sync").is_ok());
+        assert!(private_sync_url("https://[fd00::1234]:49152/sync").is_ok());
+        assert!(private_sync_url("https://[2001:4860:4860::8888]:49152/sync").is_err());
         assert!(private_sync_url("http://192.168.1.20:49152/sync").is_err());
         assert!(private_sync_url("https://example.com/sync").is_err());
         assert!(private_sync_url("https://8.8.8.8/sync").is_err());
@@ -469,11 +1371,55 @@ mod security_tests {
     }
 
     #[test]
+    fn advertises_only_reachable_private_pairing_addresses() {
+        assert!(is_pairing_address("192.168.1.20".parse().unwrap()));
+        assert!(is_pairing_address("10.0.0.2".parse().unwrap()));
+        assert!(is_pairing_address("100.100.20.3".parse().unwrap()));
+        assert!(is_pairing_address("fd7a:115c:a1e0::1234".parse().unwrap()));
+        assert!(!is_pairing_address("127.0.0.1".parse().unwrap()));
+        assert!(!is_pairing_address("169.254.20.3".parse().unwrap()));
+        assert!(!is_pairing_address("8.8.8.8".parse().unwrap()));
+        assert!(!is_pairing_address("2001:4860:4860::8888".parse().unwrap()));
+    }
+
+    #[test]
     fn pairing_tokens_are_exactly_256_bits() {
         let token = URL_SAFE_NO_PAD.encode([7_u8; 32]);
         assert_eq!(decode_token(&token).unwrap(), [7_u8; 32]);
         assert!(decode_token(&URL_SAFE_NO_PAD.encode([7_u8; 31])).is_err());
         assert!(decode_token("not base64!").is_err());
+    }
+
+    #[test]
+    fn an_ended_sync_listener_is_not_reported_as_active() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (shutdown, _shutdown_requested) = oneshot::channel();
+        let state = AppState {
+            active_sync: Arc::new(Mutex::new(Some(ActiveSyncServer {
+                endpoint: "https://192.168.1.20:49152/sync".into(),
+                token: [7_u8; 32],
+                certificate: vec![8_u8; 64],
+                running: running.clone(),
+                shutdown,
+            }))),
+            ..AppState::default()
+        };
+
+        assert!(active_server_matches(
+            &state,
+            "https://192.168.1.20:49152/sync",
+            &[7_u8; 32],
+            &[8_u8; 64],
+        )
+        .unwrap());
+        running.store(false, AtomicOrdering::Release);
+        assert!(!active_server_matches(
+            &state,
+            "https://192.168.1.20:49152/sync",
+            &[7_u8; 32],
+            &[8_u8; 64],
+        )
+        .unwrap());
     }
 
     #[tokio::test]
@@ -489,15 +1435,21 @@ mod security_tests {
         let tls = RustlsConfig::from_der(vec![certificate.clone()], signing_key.serialize_der())
             .await
             .unwrap();
+        let mirrored_payload = Arc::new(RwLock::new(SyncDocument {
+            payload: "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA".into(),
+            revision: 0,
+        }));
         let state = SyncServerState {
             token: [7_u8; 32],
-            expires_at: Instant::now() + Duration::from_secs(30),
-            payload: Arc::new(RwLock::new(
-                "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA".into(),
-            )),
-            received: Arc::new(Mutex::new(None)),
+            pairing: Arc::new(Mutex::new(Some(PairingInvitation {
+                token: [8_u8; 32],
+                expires_at: Instant::now() + Duration::from_secs(30),
+            }))),
+            document: mirrored_payload.clone(),
+            openrouter_key: Arc::new(Mutex::new(None)),
         };
         let app = Router::new()
+            .route("/pair", post(complete_pairing_for_peer))
             .route("/sync", get(download_sync).put(upload_sync))
             .layer(DefaultBodyLimit::max(MAX_SYNC_BYTES))
             .with_state(state);
@@ -505,7 +1457,27 @@ mod security_tests {
         let task = tokio::spawn(server.serve(app.into_make_service()));
         let endpoint = format!("https://{address}:{port}/sync");
         let token = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let pairing_token = URL_SAFE_NO_PAD.encode([8_u8; 32]);
         let pinned = URL_SAFE_NO_PAD.encode(certificate);
+
+        let paired = private_sync_client(&pinned)
+            .unwrap()
+            .post(format!("https://{address}:{port}/pair"))
+            .bearer_auth(&pairing_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), StatusCode::OK);
+        assert_eq!(paired.text().await.unwrap(), token);
+        let retry = private_sync_client(&pinned)
+            .unwrap()
+            .post(format!("https://{address}:{port}/pair"))
+            .bearer_auth(pairing_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+        assert_eq!(retry.text().await.unwrap(), token);
 
         let response = private_sync_client(&pinned)
             .unwrap()
@@ -515,6 +1487,51 @@ mod security_tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(REVISION_HEADER).unwrap(), "0");
+
+        mirrored_payload.write().await.payload = "BBBBBBBBBBBBBBBB.BBBBBBBBBBBBBBBBBBBBBB".into();
+        let refreshed = private_sync_client(&pinned)
+            .unwrap()
+            .get(&endpoint)
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.text().await.unwrap(),
+            "BBBBBBBBBBBBBBBB.BBBBBBBBBBBBBBBBBBBBBB"
+        );
+
+        let upload = private_sync_client(&pinned)
+            .unwrap()
+            .put(&endpoint)
+            .bearer_auth(&token)
+            .header(BASE_REVISION_HEADER, "0")
+            .body("AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload.status(), StatusCode::NO_CONTENT);
+        assert_eq!(upload.headers().get(REVISION_HEADER).unwrap(), "1");
+        assert_eq!(
+            mirrored_payload.read().await.payload.as_str(),
+            "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA"
+        );
+
+        let conflict = private_sync_client(&pinned)
+            .unwrap()
+            .put(&endpoint)
+            .bearer_auth(&token)
+            .header(BASE_REVISION_HEADER, "0")
+            .body("BBBBBBBBBBBBBBBB.BBBBBBBBBBBBBBBBBBBBBB")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            mirrored_payload.read().await.payload.as_str(),
+            "AAAAAAAAAAAAAAAA.AAAAAAAAAAAAAAAAAAAAAA"
+        );
 
         let other = generate_simple_self_signed(vec![address.to_string()]).unwrap();
         let wrong_pin = URL_SAFE_NO_PAD.encode(other.cert.der());

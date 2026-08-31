@@ -1,21 +1,30 @@
 package app.leafy.financas
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Bundle
+import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.provider.Settings
 import android.provider.OpenableColumns
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.FileProvider
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.UUID
 import java.util.concurrent.Executors
 import kotlin.math.max
@@ -28,21 +37,30 @@ class MainActivity : TauriActivity() {
     private const val MAX_TEXT_CHARS = 150_000
     private const val MAX_IMAGE_EDGE = 2048
     private const val SHARE_CONSUMED = "app.leafy.financas.SHARE_CONSUMED"
+    private const val MAX_RELEASE_BYTES = 64L * 1024L
+    private const val MAX_UPDATE_BYTES = 200L * 1024L * 1024L
+    private const val MAX_UPDATE_REDIRECTS = 5
   }
 
   private data class PendingEvent(val name: String, val json: String)
 
   private val receiptExecutor = Executors.newSingleThreadExecutor()
+  private val updateExecutor = Executors.newSingleThreadExecutor()
   @Volatile private var pendingEvent: PendingEvent? = null
+  @Volatile private var pendingUpdateFile: File? = null
   private var leafyWebView: WebView? = null
+
+  private external fun initTlsVerifier()
 
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     super.onCreate(savedInstanceState)
+    initTlsVerifier()
   }
 
   override fun onWebViewCreate(webView: WebView) {
     leafyWebView = webView
+    webView.addJavascriptInterface(UpdateBridge(), "LeafyAndroid")
     receiveShareIntent(intent)
     dispatchPendingEvent()
   }
@@ -56,7 +74,218 @@ class MainActivity : TauriActivity() {
   override fun onDestroy() {
     leafyWebView = null
     receiptExecutor.shutdownNow()
+    updateExecutor.shutdownNow()
     super.onDestroy()
+  }
+
+  override fun onResume() {
+    super.onResume()
+    val update = pendingUpdateFile ?: return
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls()) {
+      pendingUpdateFile = null
+      openPackageInstaller(update)
+    }
+  }
+
+  private inner class UpdateBridge {
+    @JavascriptInterface
+    fun checkForUpdates() {
+      updateExecutor.execute { checkForAndroidUpdate() }
+    }
+
+    @JavascriptInterface
+    fun installUpdate(downloadUrl: String) {
+      if (!isOfficialUpdateUrl(downloadUrl, false)) {
+        emitUpdateError("Leafy refused an untrusted update address.")
+        return
+      }
+      updateExecutor.execute { downloadAndInstallUpdate(downloadUrl) }
+    }
+  }
+
+  private data class ReleaseVersion(val core: List<Long>, val testing: Long?) : Comparable<ReleaseVersion> {
+    override fun compareTo(other: ReleaseVersion): Int {
+      core.zip(other.core).firstOrNull { (left, right) -> left != right }?.let { (left, right) ->
+        return left.compareTo(right)
+      }
+      return when {
+        testing == null && other.testing != null -> 1
+        testing != null && other.testing == null -> -1
+        else -> (testing ?: 0).compareTo(other.testing ?: 0)
+      }
+    }
+  }
+
+  private fun parseReleaseVersion(value: String): ReleaseVersion? {
+    val match = Regex("^v?(\\d+)\\.(\\d+)\\.(\\d+)(?:-testing\\.(\\d+))?$").matchEntire(value.trim())
+      ?: return null
+    return try {
+      ReleaseVersion(
+        listOf(match.groupValues[1].toLong(), match.groupValues[2].toLong(), match.groupValues[3].toLong()),
+        match.groupValues[4].takeIf { it.isNotEmpty() }?.toLong(),
+      )
+    } catch (_: NumberFormatException) { null }
+  }
+
+  private fun checkForAndroidUpdate() {
+    var connection: HttpURLConnection? = null
+    try {
+      val currentVersion = BuildConfig.VERSION_NAME
+      val current = requireNotNull(parseReleaseVersion(currentVersion)) { "Invalid installed version" }
+      val testingChannel = current.testing != null
+      val endpoint = if (testingChannel) {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases?per_page=1"
+      } else {
+        "https://api.github.com/repos/MusicMaster4/Leafy/releases/latest"
+      }
+      connection = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+        instanceFollowRedirects = false
+        connectTimeout = 4_000
+        readTimeout = 6_000
+        setRequestProperty("Accept", "application/vnd.github+json")
+        setRequestProperty("User-Agent", "Leafy Android update checker")
+      }
+      require(connection.responseCode in 200..299) { "Update server returned ${connection.responseCode}" }
+      val expected = connection.contentLengthLong
+      require(expected <= MAX_RELEASE_BYTES) { "Update response is too large" }
+      val output = ByteArrayOutputStream()
+      connection.inputStream.use { input ->
+        val buffer = ByteArray(8 * 1024)
+        while (true) {
+          val count = input.read(buffer)
+          if (count < 0) break
+          require(output.size() + count <= MAX_RELEASE_BYTES) { "Update response is too large" }
+          output.write(buffer, 0, count)
+        }
+      }
+      val body = output.toString(Charsets.UTF_8.name())
+      val release = if (testingChannel) JSONArray(body).getJSONObject(0) else JSONObject(body)
+      val tag = release.getString("tag_name")
+      val latest = requireNotNull(parseReleaseVersion(tag)) { "Invalid release version" }
+      val expectedApk = if (release.optBoolean("prerelease")) "leafy-beta.apk" else "leafy.apk"
+      val assets = release.getJSONArray("assets")
+      var apkUrl: String? = null
+      for (index in 0 until assets.length()) {
+        val asset = assets.getJSONObject(index)
+        if (asset.optString("name") == expectedApk) {
+          val candidate = asset.getString("browser_download_url")
+          if (isOfficialUpdateUrl(candidate, false)) apkUrl = candidate
+          break
+        }
+      }
+      val payload = JSONObject()
+        .put("currentVersion", currentVersion)
+        .put("latestVersion", tag.removePrefix("v"))
+        .put("available", latest > current)
+        .put("apkUrl", apkUrl ?: JSONObject.NULL)
+        .put("updaterUrl", "https://github.com/MusicMaster4/Leafy/releases/download/$tag/latest.json")
+      emitWebEvent("leafy:update-check-result", payload)
+    } catch (_: Exception) {
+      emitWebEvent("leafy:update-check-error", JSONObject().put("message", "Could not reach GitHub Releases."))
+    } finally {
+      connection?.disconnect()
+    }
+  }
+
+  private fun downloadAndInstallUpdate(downloadUrl: String) {
+    val directory = File(cacheDir, "updates").apply { mkdirs() }
+    val destination = File(directory, "leafy-update.apk")
+    val temporary = File(directory, "leafy-update.apk.part")
+    try {
+      var current = downloadUrl
+      var redirects = 0
+      var connection: HttpURLConnection
+      while (true) {
+        val allowRedirectHost = redirects > 0
+        require(isOfficialUpdateUrl(current, allowRedirectHost)) { "Untrusted update redirect" }
+        connection = (URL(current).openConnection() as HttpURLConnection).apply {
+          instanceFollowRedirects = false
+          connectTimeout = 10_000
+          readTimeout = 30_000
+          setRequestProperty("Accept", "application/octet-stream")
+          setRequestProperty("User-Agent", "Leafy Android updater")
+        }
+        val status = connection.responseCode
+        if (status !in 300..399) break
+        val location = connection.getHeaderField("Location") ?: throw IllegalStateException("Missing update redirect")
+        connection.disconnect()
+        redirects += 1
+        require(redirects <= MAX_UPDATE_REDIRECTS) { "Too many update redirects" }
+        current = URL(URL(current), location).toString()
+      }
+      require(connection.responseCode in 200..299) { "Update server returned ${connection.responseCode}" }
+      val expected = connection.contentLengthLong
+      require(expected in 1..MAX_UPDATE_BYTES) { "Invalid update size" }
+      connection.inputStream.use { input ->
+        FileOutputStream(temporary).use { output ->
+          val buffer = ByteArray(64 * 1024)
+          var total = 0L
+          while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            total += count
+            require(total <= MAX_UPDATE_BYTES) { "Update is too large" }
+            output.write(buffer, 0, count)
+            emitUpdateProgress(((total * 100L) / expected).toInt().coerceIn(0, 100))
+          }
+          require(total == expected) { "Incomplete update download" }
+        }
+      }
+      connection.disconnect()
+      if (destination.exists()) destination.delete()
+      require(temporary.renameTo(destination)) { "Could not prepare the update" }
+      runOnUiThread { requestPackageInstall(destination) }
+    } catch (_: Exception) {
+      temporary.delete()
+      emitUpdateError("Leafy could not securely download this update.")
+    }
+  }
+
+  private fun isOfficialUpdateUrl(value: String, allowRedirectHost: Boolean): Boolean = try {
+    val url = URL(value)
+    if (url.protocol != "https" || url.userInfo != null || url.port != -1 || url.ref != null) false
+    else if (!allowRedirectHost) {
+      url.query == null && url.host == "github.com" &&
+        url.path.startsWith("/MusicMaster4/Leafy/releases/download/v") &&
+        (url.path.endsWith("/leafy.apk") || url.path.endsWith("/leafy-beta.apk"))
+    } else {
+      url.host.endsWith(".githubusercontent.com") || url.host == "githubusercontent.com"
+    }
+  } catch (_: Exception) { false }
+
+  private fun requestPackageInstall(file: File) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+      pendingUpdateFile = file
+      emitUpdateStatus("permission")
+      startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName")))
+      return
+    }
+    openPackageInstaller(file)
+  }
+
+  private fun openPackageInstaller(file: File) {
+    try {
+      val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+      startActivity(Intent(Intent.ACTION_VIEW).apply {
+        setDataAndType(uri, "application/vnd.android.package-archive")
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+      })
+      emitUpdateStatus("installing")
+    } catch (_: ActivityNotFoundException) {
+      emitUpdateError("Android could not open the package installer.")
+    }
+  }
+
+  private fun emitUpdateProgress(percent: Int) {
+    emitWebEvent("leafy:update-progress", JSONObject().put("percent", percent))
+  }
+
+  private fun emitUpdateStatus(status: String) {
+    emitWebEvent("leafy:update-status", JSONObject().put("status", status))
+  }
+
+  private fun emitUpdateError(message: String) {
+    emitWebEvent("leafy:update-error", JSONObject().put("message", message))
   }
 
   private fun receiveShareIntent(sharedIntent: Intent?) {
@@ -249,6 +478,21 @@ class MainActivity : TauriActivity() {
     queueEvent("leafy:share-error", JSONObject().put("message", message))
   }
 
+  private fun emitWebEvent(name: String, payload: JSONObject) {
+    val webView = leafyWebView ?: return
+    val quotedName = JSONObject.quote(name)
+    val quotedJson = JSONObject.quote(payload.toString())
+    webView.post {
+      webView.evaluateJavascript(
+        "window.dispatchEvent(new CustomEvent($quotedName,{detail:JSON.parse($quotedJson)}));",
+        null,
+      )
+    }
+  }
+
+  // Shared files can arrive before React mounts, so only those events need the
+  // readiness queue. Update events are initiated by React and are dispatched
+  // directly to the listeners that started the operation.
   private fun queueEvent(name: String, payload: JSONObject) {
     pendingEvent = PendingEvent(name, payload.toString())
     dispatchPendingEvent()

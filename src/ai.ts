@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core'
 import type { TransactionType } from './types'
+import type { PairingDetails } from './sync'
+import { secureGet, secureRemove, secureSet } from './storage'
 
 const expenseRules: Array<[RegExp, string]> = [
   [/rent|mortgage|condo|electric|water|utility/i, 'Housing'],
@@ -23,14 +25,35 @@ export function localCategory(description: string, type: TransactionType) {
   return match?.[1] ?? 'Other'
 }
 
-export async function categorizeWithAi(description: string, type: TransactionType) {
+export async function categorizeWithAi(description: string, type: TransactionType, peer?: PairingDetails | null) {
   try {
     return await invoke<string>('categorize_transaction', { description, transactionType: type })
-  } catch {
-    return localCategory(description, type)
+  } catch { /* A paired computer can provide AI without sharing its API key. */ }
+  if (peer) {
+    try {
+      return await invoke<string>('categorize_via_peer', {
+        endpoint: peer.endpoint,
+        certificate: peer.certificate,
+        token: peer.token,
+        description,
+        transactionType: type,
+      })
+    } catch { /* Offline categorization remains available. */ }
+  }
+  return localCategory(description, type)
+}
+
+export async function configureOpenRouter(key: string, persist = true) {
+  const trimmed = key.trim()
+  await invoke<void>('set_openrouter_key', { key: trimmed })
+  if (persist) {
+    if (trimmed) await secureSet('openrouter-key', trimmed)
+    else await secureRemove('openrouter-key')
   }
 }
 
-export async function configureOpenRouter(key: string) {
-  return invoke<void>('set_openrouter_key', { key })
+export async function restoreOpenRouter() {
+  const key = await secureGet<string>('openrouter-key')
+  if (key) await configureOpenRouter(key, false)
+  return Boolean(key)
 }

@@ -1,31 +1,35 @@
 import { createContext, FormEvent, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import {
-  ArrowDownRight, ArrowLeftRight, ArrowUpRight, Bell, ChevronDown, CircleDollarSign,
-  AlertTriangle, Eye, EyeOff, FileCheck2, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
+  ArrowDownRight, ArrowLeftRight, ArrowUpRight, ChevronDown, CircleDollarSign,
+  AlertTriangle, CalendarClock, Eye, EyeOff, FileCheck2, KeyRound, LayoutDashboard, Link2, Monitor, MoreHorizontal, PieChart as PieIcon, Plus, QrCode,
   ReceiptText, RefreshCw, Search, Settings, ShieldCheck, Smartphone, Trash2, TrendingUp, Unplug,
   WalletCards, WandSparkles, X,
 } from 'lucide-react'
 import {
   Area, AreaChart, Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer,
-  Tooltip, XAxis, YAxis,
+  Line, LineChart, ReferenceLine, Tooltip, XAxis, YAxis,
 } from 'recharts'
 import { QRCodeSVG } from 'qrcode.react'
 import { format, parseISO } from 'date-fns'
 import { enUS } from 'date-fns/locale'
-import { categorySeries, dailySeries, lastDays, money, parseAmount, summarize } from './finance'
+import { balanceZeroOffset, categorySeries, cumulativeBalanceSeries, dailySeries, lastDays, money, parseAmount, summarize } from './finance'
 import { demoTransactions } from './data'
 import {
   currencies, currencyDetails, expenseCategories, incomeCategories, isCurrencyCode,
-  type CurrencyCode, type Transaction, type TransactionType,
+  type CurrencyCode, type RecurringExpense, type Transaction, type TransactionType,
 } from './types'
-import { categorizeWithAi, configureOpenRouter, localCategory } from './ai'
+import { categorizeWithAi, configureOpenRouter, localCategory, restoreOpenRouter } from './ai'
 import leafyIcon from '../src-tauri/icons/app-icon.svg'
 import { secureGet, secureSet } from './storage'
 import { analyzeReceipt, isSharedReceipt, type SharedReceipt } from './receipt'
 import {
-  createPairing, forgetPeer, mergeTransactions, parsePairing, pullFromPeer, pushToPeer,
-  rememberPeer, savedPeer, scanPairingCode, serializePairing, type PairingDetails,
+  completePairing, createPairing, forgetPeer, hostedSyncServerActive, mergeSnapshots, parsePairing, publishSnapshot, pullFromPeer, pullHostedSnapshot,
+  rememberPeer, rememberSyncCheckpoint, resumeHostedSync, savedPeer, savedSyncCheckpoint, scanPairingCode,
+  serializePairing, snapshotEquals, type LedgerSnapshot, type PairingDetails,
 } from './sync'
+import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { canInstallAndroidUpdate, checkForUpdates, installAndroidUpdate, installDesktopUpdate, type UpdateCheck } from './updates'
+import { materializeRecurringExpenses, nextMonthlyOccurrence, nextRecurringDueDate } from './recurring'
 
 const COLORS: Record<string, string> = {
   Food: '#d9a441', Housing: '#718bdb', Transport: '#51a98e', Leisure: '#d86f91',
@@ -35,6 +39,14 @@ const COLORS: Record<string, string> = {
 const CurrencyContext = createContext<CurrencyCode>('BRL')
 const useCurrency = () => useContext(CurrencyContext)
 type DashboardSection = 'overview' | 'transactions' | 'insights'
+type DashboardPreferences = { days: number; showBalance: boolean }
+
+function errorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message) return error.message
+  if (typeof error === 'string' && error.trim()) return error
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message
+  return fallback
+}
 
 function useTransactions() {
   const [transactions, setTransactions] = useState<Transaction[]>([])
@@ -63,15 +75,31 @@ function useTransactions() {
   return [transactions, setTransactions, ready, storageError] as const
 }
 
+function useRecurringExpenses() {
+  const [recurringExpenses, setRecurringExpenses] = useState<RecurringExpense[]>([])
+  const [ready, setReady] = useState(false)
+  const [storageError, setStorageError] = useState(false)
+  useEffect(() => {
+    void secureGet<RecurringExpense[]>('recurring-expenses')
+      .then(rows => setRecurringExpenses(Array.isArray(rows) ? rows : []))
+      .catch(() => setStorageError(true))
+      .finally(() => setReady(true))
+  }, [])
+  useEffect(() => {
+    if (ready && !storageError) void secureSet('recurring-expenses', recurringExpenses).catch(() => setStorageError(true))
+  }, [ready, recurringExpenses, storageError])
+  return [recurringExpenses, setRecurringExpenses, ready, storageError] as const
+}
+
 function StatCard({ label, value, type, note, hidden }: { label: string; value: number; type: 'balance' | 'income' | 'expense'; note: string; hidden?: boolean }) {
   const Icon = type === 'income' ? ArrowUpRight : type === 'expense' ? ArrowDownRight : WalletCards
   const currency = useCurrency()
   return (
-    <div className={`stat-card ${type}`}>
+    <article className={`stat-card ${type}`}>
       <div className="stat-top"><span>{label}</span><span className="stat-icon"><Icon size={18} /></span></div>
       <strong>{hidden ? `${currencyDetails(currency).symbol} •••••` : money(value, false, currency)}</strong>
       <small>{note}</small>
-    </div>
+    </article>
   )
 }
 
@@ -81,15 +109,22 @@ function CustomTooltip({ active, payload, label }: any) {
   return <div className="chart-tooltip"><b>{label}</b>{payload.map((p: any) => <span key={p.name} style={{ color: p.color }}>{p.name}: {money(p.value, false, currency)}</span>)}</div>
 }
 
-function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: Transaction, useAi: boolean) => void }) {
+function AddTransaction({ onClose, onAdd, onSchedule }: {
+  onClose: () => void
+  onAdd: (row: Transaction, useAi: boolean) => void
+  onSchedule: (rule: RecurringExpense, useAi: boolean) => void
+}) {
   const currency = useCurrency()
   const [type, setType] = useState<TransactionType>('expense')
   const [amount, setAmount] = useState('')
   const [description, setDescription] = useState('')
+  const [recurring, setRecurring] = useState(false)
+  const [dayOfMonth, setDayOfMonth] = useState(String(new Date().getDate()))
   const categories = type === 'expense' ? expenseCategories : incomeCategories
   const [category, setCategory] = useState('Auto')
 
   useEffect(() => setCategory('Auto'), [type])
+  useEffect(() => { if (type === 'income') setRecurring(false) }, [type])
   useEffect(() => document.querySelector<HTMLInputElement>('#amount')?.focus(), [])
 
   const submit = (event: FormEvent) => {
@@ -98,6 +133,19 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
     if (!value || value <= 0) return
     const automatic = category === 'Auto'
     const label = description.trim() || (type === 'expense' ? 'Expense' : 'Income')
+    if (recurring && type === 'expense') {
+      const chargeDay = Number(dayOfMonth)
+      if (!Number.isInteger(chargeDay) || chargeDay < 1 || chargeDay > 31) return
+      onSchedule({
+        id: crypto.randomUUID(),
+        amount: value,
+        description: label,
+        category: automatic ? 'Other' : category,
+        dayOfMonth: chargeDay,
+        startDate: nextMonthlyOccurrence(chargeDay),
+      }, automatic)
+      return
+    }
     onAdd({ id: crypto.randomUUID(), type, amount: value, description: label, category: automatic ? 'Other' : category, date: format(new Date(), 'yyyy-MM-dd') }, automatic)
   }
 
@@ -105,7 +153,7 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
     <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && onClose()}>
       <form className="quick-entry" onSubmit={submit}>
         <div className="entry-head">
-          <div><span className="eyebrow">QUICK ENTRY</span><h2>What happened?</h2></div>
+          <div><span className="eyebrow">Quick entry</span><h2>What happened?</h2></div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20} /></button>
         </div>
         <div className="type-switch">
@@ -114,17 +162,31 @@ function AddTransaction({ onClose, onAdd }: { onClose: () => void; onAdd: (row: 
         </div>
         <label className="amount-field"><span>Amount</span><div><b>{currencyDetails(currency).symbol}</b><input id="amount" inputMode="decimal" maxLength={24} placeholder="0.00" value={amount} onChange={e => setAmount(e.target.value)} /></div></label>
         <label className="input-label"><span>Description <i>optional</i></span><input maxLength={200} placeholder={type === 'expense' ? 'Example: lunch, groceries...' : 'Example: salary, freelance...'} value={description} onChange={e => setDescription(e.target.value)} /></label>
+        {type === 'expense' && <div className="recurring-field">
+          <button type="button" className={recurring ? 'recurring-toggle active' : 'recurring-toggle'} aria-pressed={recurring} onClick={() => setRecurring(value => !value)}>
+            <CalendarClock size={19}/><span><b>Repeat monthly</b><small>Schedule this expense automatically</small></span><i aria-hidden="true"/>
+          </button>
+          {recurring && <div className="recurring-options">
+            <label className="input-label"><span>Charge day</span><input type="number" inputMode="numeric" min="1" max="31" required value={dayOfMonth} onChange={event => setDayOfMonth(event.target.value)}/></label>
+            {Number(dayOfMonth) >= 1 && Number(dayOfMonth) <= 31 && <p>Next charge: <b>{format(parseISO(nextMonthlyOccurrence(Number(dayOfMonth))), 'MMMM d, yyyy', { locale: enUS })}</b>. Shorter months use their final day.</p>}
+          </div>}
+        </div>}
         <div className="category-field"><span>Category</span><div className="category-chips"><button type="button" className={category === 'Auto' ? 'active auto' : ''} onClick={() => setCategory('Auto')}><WandSparkles size={12} /> Auto</button>{categories.map(item => <button type="button" className={category === item ? 'active' : ''} onClick={() => setCategory(item)} key={item}>{item}</button>)}</div>{category === 'Auto' && <small className="auto-hint">Leafy will categorize it with AI. Local matching is used when offline.</small>}</div>
-        <button className={`save-button ${type}`} type="submit">Save {type === 'expense' ? 'expense' : 'income'} <span>↵</span></button>
-        <p className="privacy-note">Stored only on this device</p>
+        <button className={`save-button ${type}`} type="submit">{recurring ? 'Schedule monthly expense' : `Save ${type === 'expense' ? 'expense' : 'income'}`} <span>↵</span></button>
+        <p className="privacy-note">Stored privately on your devices</p>
       </form>
     </div>
   )
 }
 
-function PreferencesPanel({ currency, onCurrencyChange, onClose, onNotice }: {
+function PreferencesPanel({ currency, checkingUpdates, mirrorMode, openRouterConfigured, onCurrencyChange, onKeyConfigured, onCheckUpdates, onClose, onNotice }: {
   currency: CurrencyCode
+  checkingUpdates: boolean
+  mirrorMode: boolean
+  openRouterConfigured: boolean
   onCurrencyChange: (currency: CurrencyCode) => Promise<void>
+  onKeyConfigured: () => void
+  onCheckUpdates: () => Promise<void>
   onClose: () => void
   onNotice: (message: string) => void
 }) {
@@ -136,21 +198,25 @@ function PreferencesPanel({ currency, onCurrencyChange, onClose, onNotice }: {
     setSaving(true)
     try {
       await onCurrencyChange(selectedCurrency)
-      if (key.trim()) await configureOpenRouter(key)
-      onNotice(key.trim() ? 'Preferences saved and OpenRouter connected' : 'Preferences saved')
+      if (key.trim()) { await configureOpenRouter(key); onKeyConfigured() }
+      onNotice(key.trim() ? 'Preferences and OpenRouter key saved' : 'Preferences saved')
       onClose()
     } catch (error) {
-      onNotice(error instanceof Error ? error.message : 'OpenRouter is available in the desktop and mobile apps')
+      onNotice(errorMessage(error, 'Could not save the OpenRouter key'))
     } finally { setSaving(false) }
   }
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry preferences-panel" onSubmit={save}>
-      <div className="entry-head"><div><span className="eyebrow">PREFERENCES</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
+      <div className="entry-head"><div><span className="eyebrow">Preferences</span><h2>Money and AI</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
+      {mirrorMode && <div className="privacy-callout mirror-callout"><Smartphone size={20}/><div><b>Shared with your computer</b><span>Currency and ledger changes made here sync to both devices.</span></div></div>}
       <label className="input-label"><span>Display currency</span><select value={selectedCurrency} onChange={event => setSelectedCurrency(event.target.value as CurrencyCode)}>{currencies.map(item => <option value={item.code} key={item.code}>{item.code} — {item.label}</option>)}</select><small>BRL is the default. Changing this label does not convert existing amounts.</small></label>
-      <div className="privacy-callout"><KeyRound size={20}/><div><b>Your key stays on this device</b><span>Leafy sends only the transaction description to OpenRouter when Auto is selected. The key is held in app memory and is never committed or synced.</span></div></div>
-      <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder="sk-or-v1-..." value={key} onChange={event => setKey(event.target.value)} /></label>
+      {!mirrorMode && <>
+        <div className="privacy-callout"><KeyRound size={20}/><div><b>One key on your computer</b><span>The key is encrypted on this device. A paired phone asks the computer to categorize; the raw key is never copied to the phone.</span></div></div>
+        <label className="input-label"><span>OpenRouter API key <i>optional</i></span><input type="password" autoComplete="off" placeholder={openRouterConfigured ? 'Saved securely — enter a new key to replace it' : 'sk-or-v1-...'} value={key} onChange={event => setKey(event.target.value)} />{openRouterConfigured && <small>An encrypted key is already saved on this device.</small>}</label>
+      </>}
+      <div className="preferences-update"><div><b>App updates</b><span>Check GitHub Releases for the newest version of your installed channel.</span></div><button type="button" onClick={() => void onCheckUpdates()} disabled={checkingUpdates}><RefreshCw size={15} className={checkingUpdates ? 'spinning' : ''}/>{checkingUpdates ? 'Checking...' : 'Check for updates'}</button></div>
       <button className="save-button income" disabled={saving}>{saving ? 'Saving...' : 'Save preferences'}</button>
-      <p className="privacy-note">You can also set OPENROUTER_API_KEY before launching Leafy.</p>
+      <p className="privacy-note">Transactions, preferences, and the encrypted key stay in app data during in-place updates.</p>
     </form>
   </div>
 }
@@ -189,7 +255,7 @@ function ReceiptReview({ source, onClose, onAdd }: {
   return <div className="modal-backdrop receipt-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <form className="quick-entry receipt-review" onSubmit={submit}>
       <div className="entry-head">
-        <div><span className="eyebrow">SHARED RECEIPT</span><h2>Review before saving</h2></div>
+        <div><span className="eyebrow">Shared receipt</span><h2>Review before saving</h2></div>
         <button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button>
       </div>
       <div className="receipt-source"><FileCheck2 size={20}/><div><b>{source.name}</b><span>Read locally on this device</span></div><em className={detected.confidence}>{detected.confidence} confidence</em></div>
@@ -213,55 +279,63 @@ function ReceiptReview({ source, onClose, onAdd }: {
   </div>
 }
 
-function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
-  transactions: Transaction[]
+function SyncPanel({ snapshot, initialPeer, onClose, onPaired }: {
+  snapshot: LedgerSnapshot
   initialPeer: PairingDetails | null
   onClose: () => void
   onPaired: (peer: PairingDetails | null) => void
-  onMerge: (rows: Transaction[]) => void
 }) {
-  const [mode, setMode] = useState<'show' | 'scan'>('show')
+  const mobileRuntime = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)
+  const [mode, setMode] = useState<'show' | 'scan'>(initialPeer?.role === 'mirror' || mobileRuntime ? 'scan' : 'show')
   const [peer, setPeer] = useState<PairingDetails | null>(initialPeer)
   const [pairingText, setPairingText] = useState('')
-  const [status, setStatus] = useState(initialPeer ? 'Connected on your local network' : '')
+  const [status, setStatus] = useState(initialPeer ? `${initialPeer.role === 'mirror' ? 'Two-way sync' : 'Computer sharing'} through ${initialPeer.networkMode === 'tailscale' ? 'Tailscale' : 'your local network'}` : '')
   const [busy, setBusy] = useState(false)
 
   const showCode = async () => {
     setBusy(true); setStatus('Starting a private local connection...')
     try {
-      const next = await createPairing(transactions)
-      await rememberPeer(next); setPeer(next); onPaired(next); setStatus('Ready for one hour. Scan this code with Leafy on your phone.')
-    } catch { setStatus('Open Leafy as a desktop app to create a pairing code.') }
+      const next = await createPairing(snapshot)
+      await rememberSyncCheckpoint(next, snapshot)
+      await rememberPeer(next)
+      setPeer(next); onPaired(next); setStatus(next.networkMode === 'tailscale' ? 'Tailscale found. Scan within one hour; the connection then stays paired. Closing this window keeps sync running.' : 'Scan within one hour on your local network; the connection then stays paired. Closing this window keeps sync running.')
+    } catch (error) { setStatus(errorMessage(error, 'Open Leafy as a desktop app to create a pairing code.')) }
     finally { setBusy(false) }
   }
 
   const connect = async (details?: PairingDetails) => {
     setBusy(true); setStatus('Connecting securely...')
     try {
-      const next = details ?? parsePairing(pairingText.trim())
-      const rows = await pullFromPeer(next)
-      await rememberPeer(next); setPeer(next); onPaired(next); onMerge(rows)
-      setStatus(`Connected. Imported ${rows.length} transactions.`)
-    } catch (error) { setStatus(error instanceof Error ? error.message : 'Could not connect') }
+      const next = await completePairing(details ?? parsePairing(pairingText.trim()))
+      // Store the durable credential as soon as the pinned exchange succeeds.
+      // A transient failure on the first ledger download must not force the
+      // user to scan again after the invitation expires.
+      await rememberPeer(next)
+      setPeer(next); onPaired(next)
+      setStatus('Two-way sync connected permanently. Reconciling both encrypted ledgers now.')
+    } catch (error) {
+      const message = errorMessage(error, 'Could not connect')
+      setStatus(nextConnectionHint(details, pairingText, message))
+    }
     finally { setBusy(false) }
   }
 
   const scanCode = async () => {
     setBusy(true)
     try { await connect(await scanPairingCode()) }
-    catch (error) { setStatus(error instanceof Error ? error.message : 'Could not scan the code'); setBusy(false) }
+    catch (error) { setStatus(errorMessage(error, 'Could not scan the code')); setBusy(false) }
   }
 
-  const disconnect = () => { forgetPeer(); setPeer(null); onPaired(null); setStatus('Device disconnected') }
-  const code = peer ? serializePairing(peer) : ''
+  const disconnect = () => { void forgetPeer(); setPeer(null); onPaired(null); setStatus('Device disconnected') }
+  const code = peer?.role === 'host' && Date.parse(peer.expiresAt) > Date.now() ? serializePairing(peer) : ''
   return <div className="modal-backdrop" onMouseDown={event => event.target === event.currentTarget && onClose()}>
     <div className="quick-entry sync-panel">
-      <div className="entry-head"><div><span className="eyebrow">PRIVATE SYNC</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
-      <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')}><Smartphone size={16}/> This phone</button></div>
+      <div className="entry-head"><div><span className="eyebrow">Private sync</span><h2>Connect your devices</h2></div><button type="button" className="icon-button" onClick={onClose} aria-label="Close"><X size={20}/></button></div>
+      <div className="sync-tabs"><button className={mode === 'show' ? 'active' : ''} onClick={() => setMode('show')} disabled={mobileRuntime}><Monitor size={16}/> This computer</button><button className={mode === 'scan' ? 'active' : ''} onClick={() => setMode('scan')} disabled={!mobileRuntime}><Smartphone size={16}/> This phone</button></div>
       {mode === 'show' ? <div className="sync-content">
-        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={240} level="L" bgColor="#f3fff8" fgColor="#10251b" /></div><p>Open Leafy on your phone, choose <b>Devices</b>, then scan this code.</p></> : <div className="sync-empty"><QrCode size={42}/><b>Pair with your phone</b><span>Both devices need to be on the same Wi-Fi network for the first private sync.</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
+        {code ? <><div className="qr-frame"><QRCodeSVG value={code} size={320} level="L" marginSize={4} bgColor="#ffffff" fgColor="#000000" /></div><p>On your phone, open <b>Leafy → Devices → This phone</b>. Scan within one hour. After pairing, changes sync in both directions and reconnect automatically.</p></> : <div className="sync-empty"><QrCode size={42}/><b>{peer ? 'Create a fresh pairing code' : 'Pair with your phone'}</b><span>{peer ? 'This device remains paired. Create a new code only if you need to pair the phone again.' : 'Leafy keeps one encrypted ledger shared between this computer and your phone over Tailscale or local Wi-Fi.'}</span><button onClick={showCode} disabled={busy}><Link2 size={16}/>{busy ? 'Starting...' : 'Create pairing code'}</button></div>}
       </div> : <div className="sync-content scan-content">
-        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>The time-limited QR carries a pinned TLS certificate and a separate 256-bit encryption key. Your financial data remains end-to-end encrypted.</p>
+        <div className="phone-graphic"><Smartphone size={38}/><span><i/></span></div><b>Scan the code on your computer</b><p>This phone joins the same editable ledger permanently. The QR itself is valid for one hour and pins the computer's TLS certificate.</p>
         <button className="scan-button" onClick={scanCode} disabled={busy}><QrCode size={17}/>{busy ? 'Opening camera...' : 'Scan QR code'}</button>
         <div className="manual-code"><span>or paste the pairing link</span><input aria-label="Pairing link" placeholder="leafy://pair?..." value={pairingText} onChange={event => setPairingText(event.target.value)}/><button onClick={() => connect()} disabled={!pairingText.trim() || busy}>Connect</button></div>
       </div>}
@@ -271,10 +345,31 @@ function SyncPanel({ transactions, initialPeer, onClose, onPaired, onMerge }: {
   </div>
 }
 
+function BalanceTooltip({ active, payload, label }: any) {
+  const currency = useCurrency()
+  if (!active || !payload?.length || !label) return null
+  const value = Number(payload[0].value)
+  return <div className="chart-tooltip"><b>{format(parseISO(label), 'MMM d, yyyy', { locale: enUS })}</b><span style={{ color: value >= 0 ? '#b8d96f' : '#ef8a71' }}>Balance: {money(value, false, currency)}</span></div>
+}
+
+function nextConnectionHint(details: PairingDetails | undefined, pairingText: string, message: string) {
+  let connection = details
+  if (!connection && pairingText.trim()) {
+    try { connection = parsePairing(pairingText.trim()) } catch { return message }
+  }
+  if (connection?.networkMode === 'tailscale' && /failed|connect|reach|timed? out/i.test(message)) {
+    return `${message} Keep Tailscale connected on both devices and allow leafy-financas.exe on private networks in Windows Firewall.`
+  }
+  return message
+}
+
 export default function App() {
   const [transactions, setTransactions, storageReady, storageError] = useTransactions()
+  const [recurringExpenses, setRecurringExpenses, recurringReady, recurringStorageError] = useRecurringExpenses()
   const [days, setDays] = useState(30)
   const [showBalance, setShowBalance] = useState(true)
+  const [preferencesReady, setPreferencesReady] = useState(false)
+  const [openRouterConfigured, setOpenRouterConfigured] = useState(false)
   const [entryOpen, setEntryOpen] = useState(false)
   const [preferencesOpen, setPreferencesOpen] = useState(false)
   const [syncOpen, setSyncOpen] = useState(false)
@@ -283,20 +378,40 @@ export default function App() {
   const [peer, setPeer] = useState<PairingDetails | null>(null)
   const [search, setSearch] = useState('')
   const [toast, setToast] = useState('')
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false)
+  const [checkingUpdates, setCheckingUpdates] = useState(false)
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateCheck | null>(null)
+  const [installingUpdate, setInstallingUpdate] = useState(false)
+  const [updateProgress, setUpdateProgress] = useState(0)
   const [activeSection, setActiveSection] = useState<DashboardSection>('overview')
+  const [todayKey, setTodayKey] = useState(() => format(new Date(), 'yyyy-MM-dd'))
+  const profileMenuRef = useRef<HTMLDivElement>(null)
   const overviewRef = useRef<HTMLElement>(null)
   const transactionsRef = useRef<HTMLElement>(null)
   const insightsRef = useRef<HTMLElement>(null)
+  const ledgerSnapshotRef = useRef<LedgerSnapshot>({ transactions: [], recurringExpenses: [], currency: 'BRL' })
   const periodRows = useMemo(() => lastDays(transactions, days), [transactions, days])
   const summary = useMemo(() => summarize(periodRows), [periodRows])
   const allSummary = useMemo(() => summarize(transactions), [transactions])
   const chart = useMemo(() => dailySeries(periodRows, days), [periodRows, days])
+  const balanceChart = useMemo(() => cumulativeBalanceSeries(transactions), [transactions])
+  const zeroOffset = useMemo(() => balanceZeroOffset(balanceChart), [balanceChart])
   const categories = useMemo(() => categorySeries(periodRows), [periodRows])
   const weekSpend = summarize(lastDays(transactions, 7)).expenses
   const greeting = new Date().getHours() < 12 ? 'Good morning' : new Date().getHours() < 18 ? 'Good afternoon' : 'Good evening'
   const recent = transactions
     .filter(t => `${t.description} ${t.category}`.toLowerCase().includes(search.toLowerCase()))
     .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 7)
+  const recurringSorted = [...recurringExpenses].sort((a, b) => nextRecurringDueDate(a).localeCompare(nextRecurringDueDate(b)))
+  const mirrorMode = peer?.role === 'mirror'
+  const ledgerSnapshot = useMemo<LedgerSnapshot>(() => ({ transactions, recurringExpenses, currency }), [currency, recurringExpenses, transactions])
+  ledgerSnapshotRef.current = ledgerSnapshot
+
+  const applySnapshot = (incoming: LedgerSnapshot) => {
+    setTransactions(current => JSON.stringify(current) === JSON.stringify(incoming.transactions) ? current : incoming.transactions)
+    setRecurringExpenses(current => JSON.stringify(current) === JSON.stringify(incoming.recurringExpenses) ? current : incoming.recurringExpenses)
+    setCurrency(incoming.currency)
+  }
 
   const scrollToSection = (section: DashboardSection) => {
     setActiveSection(section)
@@ -305,10 +420,32 @@ export default function App() {
   }
 
   useEffect(() => {
-    void secureGet<unknown>('currency').then(value => {
-      if (isCurrencyCode(value)) setCurrency(value)
-    }).catch(() => setToast('Currency preference could not be unlocked. Using BRL.'))
+    void (async () => {
+      try {
+        const [savedCurrency, dashboard, hasOpenRouter] = await Promise.all([
+          secureGet<unknown>('currency'),
+          secureGet<DashboardPreferences>('dashboard-preferences'),
+          restoreOpenRouter(),
+        ])
+        if (isCurrencyCode(savedCurrency)) setCurrency(savedCurrency)
+        if (dashboard && [7, 30, 90].includes(dashboard.days)) setDays(dashboard.days)
+        if (dashboard && typeof dashboard.showBalance === 'boolean') setShowBalance(dashboard.showBalance)
+        setOpenRouterConfigured(hasOpenRouter)
+      } catch {
+        setToast('Some saved preferences could not be unlocked. Defaults are being used.')
+      } finally { setPreferencesReady(true) }
+    })()
   }, [])
+
+  useEffect(() => {
+    if (preferencesReady) void secureSet('dashboard-preferences', { days, showBalance } satisfies DashboardPreferences)
+      .catch(() => setToast('Dashboard preferences could not be saved.'))
+  }, [days, preferencesReady, showBalance])
+
+  useEffect(() => {
+    if (preferencesReady) void secureSet('currency', currency)
+      .catch(() => setToast('Currency preference could not be saved.'))
+  }, [currency, preferencesReady])
 
   useEffect(() => {
     const bridgeWindow = window as Window & { __leafyShareReady?: boolean }
@@ -334,48 +471,155 @@ export default function App() {
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
       if (event.key.toLowerCase() === 'n' && !['INPUT', 'TEXTAREA'].includes((event.target as HTMLElement).tagName)) setEntryOpen(true)
-      if (event.key === 'Escape') setEntryOpen(false)
+      if (event.key === 'Escape') { setEntryOpen(false); setProfileMenuOpen(false) }
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
   }, [])
 
   useEffect(() => {
-    if (storageError) setToast('Private storage could not be unlocked. Changes will not be saved.')
-  }, [storageError])
-
-  useEffect(() => {
-    void savedPeer().then(setPeer)
+    const progress = (event: Event) => {
+      const percent = (event as CustomEvent<{ percent?: unknown }>).detail?.percent
+      if (typeof percent === 'number') setUpdateProgress(percent)
+    }
+    const status = (event: Event) => {
+      const value = (event as CustomEvent<{ status?: unknown }>).detail?.status
+      if (value === 'permission') setToast('Allow Leafy to install apps, then return to continue.')
+      if (value === 'installing') setToast(canInstallAndroidUpdate() ? 'Update downloaded. Confirm the installation in Android.' : 'Update downloaded. Leafy is installing it now.')
+    }
+    const error = (event: Event) => {
+      const message = (event as CustomEvent<{ message?: unknown }>).detail?.message
+      setInstallingUpdate(false)
+      setToast(typeof message === 'string' ? message : 'Could not install the update.')
+    }
+    window.addEventListener('leafy:update-progress', progress)
+    window.addEventListener('leafy:update-status', status)
+    window.addEventListener('leafy:update-error', error)
+    const unlisten: UnlistenFn[] = []
+    let active = true
+    void Promise.all([
+      listen<{ percent?: unknown }>('leafy:update-progress', event => progress(new CustomEvent('leafy:update-progress', { detail: event.payload }))),
+      listen<{ status?: unknown }>('leafy:update-status', event => status(new CustomEvent('leafy:update-status', { detail: event.payload }))),
+      listen<{ message?: unknown }>('leafy:update-error', event => error(new CustomEvent('leafy:update-error', { detail: event.payload }))),
+    ]).then(callbacks => {
+      if (active) unlisten.push(...callbacks)
+      else callbacks.forEach(callback => callback())
+    }).catch(() => undefined)
+    return () => {
+      active = false
+      unlisten.forEach(callback => callback())
+      window.removeEventListener('leafy:update-progress', progress)
+      window.removeEventListener('leafy:update-status', status)
+      window.removeEventListener('leafy:update-error', error)
+    }
   }, [])
 
   useEffect(() => {
-    if (!peer) return
-    const remaining = Date.parse(peer.expiresAt) - Date.now()
-    const timer = window.setTimeout(() => { forgetPeer(); setPeer(null) }, Math.max(0, remaining))
-    return () => window.clearTimeout(timer)
-  }, [peer])
-
-  useEffect(() => {
-    if (!peer || !storageReady) return
-    const sync = async () => {
-      try {
-        const incoming = await pullFromPeer(peer)
-        setTransactions(current => {
-          const merged = mergeTransactions(current, incoming)
-          return JSON.stringify(merged) === JSON.stringify(current) ? current : merged
-        })
-      } catch { /* The peer may be offline. Local entries remain safe. */ }
+    if (!profileMenuOpen) return
+    const close = (event: PointerEvent) => {
+      if (!profileMenuRef.current?.contains(event.target as Node)) setProfileMenuOpen(false)
     }
-    sync()
-    const timer = window.setInterval(sync, 5000)
-    return () => window.clearInterval(timer)
-  }, [peer, setTransactions, storageReady])
+    window.addEventListener('pointerdown', close)
+    return () => window.removeEventListener('pointerdown', close)
+  }, [profileMenuOpen])
 
   useEffect(() => {
-    if (!peer || !storageReady) return
-    const timer = window.setTimeout(() => pushToPeer(peer, transactions).catch(() => undefined), 700)
-    return () => window.clearTimeout(timer)
-  }, [peer, transactions, storageReady])
+    if (storageError || recurringStorageError) setToast('Private storage could not be unlocked. Changes will not be saved.')
+  }, [recurringStorageError, storageError])
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setTodayKey(format(new Date(), 'yyyy-MM-dd')), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!storageReady || !recurringReady || storageError || recurringStorageError) return
+    const result = materializeRecurringExpenses(recurringExpenses, transactions, parseISO(todayKey))
+    if (result.transactions.length) {
+      setTransactions(current => {
+        const currentIds = new Set(current.map(row => row.id))
+        const due = result.transactions.filter(row => !currentIds.has(row.id))
+        return due.length ? [...due, ...current] : current
+      })
+      setToast(result.transactions.length === 1 ? 'Recurring expense added' : `${result.transactions.length} recurring expenses added`)
+      window.setTimeout(() => setToast(''), 3200)
+    }
+    if (result.rules !== recurringExpenses) setRecurringExpenses(result.rules)
+  }, [recurringExpenses, recurringReady, recurringStorageError, setRecurringExpenses, setTransactions, storageError, storageReady, todayKey])
+
+  useEffect(() => {
+    void savedPeer().then(saved => setPeer(current => current ?? saved))
+  }, [])
+
+  useEffect(() => {
+    if (!peer || !storageReady || !recurringReady || !preferencesReady || storageError || recurringStorageError) return
+    let active = true
+    let busy = false
+    let checkpointLoaded = false
+    let baseline: LedgerSnapshot | null = null
+    const sync = async () => {
+      if (busy) return
+      busy = true
+      try {
+        if (!checkpointLoaded) {
+          baseline = await savedSyncCheckpoint(peer)
+          checkpointLoaded = true
+        }
+        if (!active) return
+        if (peer.role === 'host' && !await hostedSyncServerActive(peer)) {
+          await resumeHostedSync(peer, ledgerSnapshotRef.current)
+        }
+        if (!active) return
+        // A compare-and-swap retry prevents two devices that write at the same
+        // moment from replacing one another's complete encrypted snapshot.
+        for (let attempt = 0; active && attempt < 4; attempt += 1) {
+          const remote = peer.role === 'host' ? await pullHostedSnapshot(peer) : await pullFromPeer(peer)
+          if (!active) return
+          const local = ledgerSnapshotRef.current
+          const merged = mergeSnapshots(baseline, local, remote.snapshot)
+          if (!snapshotEquals(local, ledgerSnapshotRef.current)) continue
+          try {
+            if (!snapshotEquals(merged, remote.snapshot)) {
+              await publishSnapshot(peer, merged, remote.revision)
+            }
+          } catch (error) {
+            if (errorMessage(error, '').toLowerCase().includes('conflict')) continue
+            throw error
+          }
+          if (!active) return
+          const previousBaseline = baseline
+          baseline = merged
+          if (!previousBaseline || !snapshotEquals(previousBaseline, merged)) {
+            await rememberSyncCheckpoint(peer, merged)
+          }
+          // Do not overwrite an edit made while the network request was in
+          // flight. It remains different from the new baseline and is sent on
+          // the next tick.
+          if (snapshotEquals(local, ledgerSnapshotRef.current) && !snapshotEquals(local, merged)) {
+            applySnapshot(merged)
+          }
+          return
+        }
+      } catch { /* Keep local encrypted data and retry while the paired device is offline. */ }
+      finally { busy = false }
+    }
+    void sync()
+    const timer = window.setInterval(sync, 1000)
+    // Browser timers are paused or heavily throttled while a phone is in the
+    // background and while a computer sleeps. Retry immediately when either
+    // device becomes usable instead of waiting for a stale interval tick.
+    const resumeSync = () => { if (document.visibilityState !== 'hidden') void sync() }
+    window.addEventListener('focus', resumeSync)
+    window.addEventListener('online', resumeSync)
+    document.addEventListener('visibilitychange', resumeSync)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+      window.removeEventListener('focus', resumeSync)
+      window.removeEventListener('online', resumeSync)
+      document.removeEventListener('visibilitychange', resumeSync)
+    }
+  }, [peer, preferencesReady, recurringReady, recurringStorageError, storageError, storageReady])
 
   const add = async (row: Transaction, useAi: boolean) => {
     if (storageError) {
@@ -387,21 +631,77 @@ export default function App() {
     setToast(row.type === 'expense' ? 'Expense saved' : 'Income saved')
     window.setTimeout(() => setToast(''), 2600)
     if (useAi) {
-      const category = await categorizeWithAi(row.description, row.type)
+      const category = await categorizeWithAi(row.description, row.type, peer)
       setTransactions(current => current.map(item => item.id === row.id ? { ...item, category } : item))
       setToast(`Categorized as ${category}`)
       window.setTimeout(() => setToast(''), 2600)
     }
   }
+  const scheduleRecurring = async (rule: RecurringExpense, useAi: boolean) => {
+    if (storageError || recurringStorageError) {
+      setToast('Unlock private storage before scheduling recurring expenses.')
+      return
+    }
+    setRecurringExpenses(current => [rule, ...current])
+    setEntryOpen(false)
+    setToast(`Scheduled monthly for day ${rule.dayOfMonth}`)
+    window.setTimeout(() => setToast(''), 3000)
+    if (useAi) {
+      const category = await categorizeWithAi(rule.description, 'expense', peer)
+      setRecurringExpenses(current => current.map(item => item.id === rule.id ? { ...item, category } : item))
+      setTransactions(current => current.map(item => item.recurringExpenseId === rule.id ? { ...item, category } : item))
+    }
+  }
   const remove = (id: string) => storageError
     ? setToast('Unlock private storage before changing transactions.')
     : setTransactions(current => current.filter(t => t.id !== id))
+  const removeRecurring = (id: string) => recurringStorageError
+    ? setToast('Unlock private storage before changing recurring expenses.')
+    : setRecurringExpenses(current => current.filter(rule => rule.id !== id))
+
+  const checkUpdates = async () => {
+    setCheckingUpdates(true)
+    let completed = false
+    try {
+      const update = await checkForUpdates()
+      completed = true
+      if (update.available) {
+        setAvailableUpdate(update)
+        setToast('')
+      } else setToast(`Leafy ${update.currentVersion} is up to date`)
+    } catch (error) {
+      const timedOut = error instanceof Error && error.message.toLowerCase().includes('timed out')
+      setToast(timedOut ? 'Update check took too long. Check your connection and try again.' : 'Could not check for updates. Try again in a moment.')
+    } finally {
+      setCheckingUpdates(false)
+      setProfileMenuOpen(false)
+      if (completed) setPreferencesOpen(false)
+      window.setTimeout(() => setToast(''), 4200)
+    }
+  }
+
+  const installAvailableUpdate = async () => {
+    if (!availableUpdate) return
+    try {
+      setInstallingUpdate(true)
+      setUpdateProgress(0)
+      if (canInstallAndroidUpdate()) {
+        if (!availableUpdate.apkUrl) throw new Error('Android update package is unavailable')
+        installAndroidUpdate(availableUpdate.apkUrl)
+      } else {
+        await installDesktopUpdate(availableUpdate.updaterUrl)
+      }
+    } catch (error) {
+      setInstallingUpdate(false)
+      setToast(errorMessage(error, 'Could not download and install the update.'))
+    }
+  }
 
   return (
     <CurrencyContext.Provider value={currency}>
     <div className="app-shell">
       <aside>
-        <div className="brand"><img className="brand-mark" src={leafyIcon} alt="" /><div>Leafy<small>MONEY, SIMPLIFIED</small></div></div>
+        <div className="brand"><img className="brand-mark" src={leafyIcon} alt="" /><div>Leafy<small>Private ledger</small></div></div>
         <nav>
           <button className={activeSection === 'overview' && !syncOpen ? 'active' : ''} aria-current={activeSection === 'overview' && !syncOpen ? 'page' : undefined} onClick={() => scrollToSection('overview')}><LayoutDashboard size={19} />Overview</button>
           <button className={activeSection === 'transactions' && !syncOpen ? 'active' : ''} aria-current={activeSection === 'transactions' && !syncOpen ? 'page' : undefined} onClick={() => scrollToSection('transactions')}><ArrowLeftRight size={19} />Transactions</button>
@@ -411,20 +711,25 @@ export default function App() {
         <div className="side-bottom">
           <div className="weekly-card"><span className="mini-icon"><TrendingUp size={16} /></span><div><small>Spent in 7 days</small><b>{money(weekSpend, false, currency)}</b></div></div>
           <button className="settings" onClick={() => setPreferencesOpen(true)}><Settings size={18} />Preferences</button>
-          <div className="profile"><span>M</span><div><b>My money</b><small>Local data</small></div><MoreHorizontal size={18} /></div>
+          <div className="profile" ref={profileMenuRef}>
+            <span>M</span><div><b>My money</b><small>Local data</small></div>
+            <button type="button" className="profile-menu-trigger" aria-label="Account options" aria-haspopup="menu" aria-expanded={profileMenuOpen} onClick={() => setProfileMenuOpen(open => !open)}><MoreHorizontal size={18} /></button>
+            {profileMenuOpen && <div className="profile-menu" role="menu">
+              <button type="button" role="menuitem" onClick={checkUpdates} disabled={checkingUpdates}><RefreshCw size={15} className={checkingUpdates ? 'spinning' : ''}/>{checkingUpdates ? 'Checking...' : 'Check for updates'}</button>
+            </div>}
+          </div>
         </div>
       </aside>
 
       <main>
         <header ref={overviewRef}>
-          <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting} <span>Let's check on your money.</span></h1></div>
-          <div className="header-actions"><button className="icon-button" aria-label="Notifications"><Bell size={20} /></button><button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={19} />New transaction <kbd>N</kbd></button></div>
+          <div><p>{format(new Date(), 'EEEE, MMMM d', { locale: enUS })}</p><h1>{greeting}<span>Your money, at a glance.</span></h1></div>
+          <div className="header-actions">
+            {mirrorMode && <span className="mirror-badge"><Smartphone size={16}/><span><b>Devices synced</b><small>Two-way</small></span></span>}
+            <button className="icon-button mobile-settings" onClick={() => setPreferencesOpen(true)} aria-label="Preferences"><Settings size={20} /></button>
+            <button className="new-button" onClick={() => setEntryOpen(true)}><Plus size={18} />Add transaction<kbd>N</kbd></button>
+          </div>
         </header>
-
-        <section className="period-row">
-          <div className="periods">{[7, 30, 90].map(value => <button className={days === value ? 'active' : ''} onClick={() => setDays(value)} key={value}>{value === 7 ? '7 days' : value === 30 ? 'This month' : '3 months'}</button>)}</div>
-          <button className="balance-toggle" onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
-        </section>
 
         <section className="stats-grid">
           <StatCard label="Total balance" value={allSummary.balance} type="balance" note="Everything in minus everything out" hidden={!showBalance} />
@@ -432,48 +737,82 @@ export default function App() {
           <StatCard label="Expenses this period" value={summary.expenses} type="expense" note={`${periodRows.filter(t => t.type === 'expense').length} expenses recorded`} hidden={!showBalance} />
         </section>
 
+        <section className="period-row" aria-label="Dashboard controls">
+          <div className="periods">{[7, 30, 90].map(value => <button className={days === value ? 'active' : ''} aria-pressed={days === value} onClick={() => setDays(value)} key={value}>{value === 7 ? '7 days' : value === 30 ? 'This month' : '3 months'}</button>)}</div>
+          <button className="balance-toggle" aria-pressed={!showBalance} onClick={() => setShowBalance(v => !v)}>{showBalance ? <Eye size={17} /> : <EyeOff size={17} />}{showBalance ? 'Hide values' : 'Show values'}</button>
+        </section>
+
+          <button className="mobile-add-button" onClick={() => setEntryOpen(true)} aria-label="Add transaction"><Plus size={21} /><span>Add</span></button>
+
         <section className="charts-grid dashboard-anchor" ref={insightsRef}>
+          <article className="panel balance-panel">
+            <div className="panel-head"><div><span className="eyebrow">All-time balance</span><h2>Balance over time</h2></div><span className="legend"><i className="income-dot" />Above zero <i className="expense-dot" />Below zero</span></div>
+            {balanceChart.length ? <div className="chart-wrap balance-chart-wrap" role="img" aria-label={`All-time balance chart. Current balance is ${money(allSummary.balance, false, currency)}.`}>
+              <ResponsiveContainer width="100%" height="100%"><LineChart data={balanceChart} margin={{ left: -8, right: 14, top: 12, bottom: 2 }}>
+                <defs><linearGradient id="balanceStroke" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset={`${zeroOffset}%`} stopColor="#b8d96f" />
+                  <stop offset={`${zeroOffset}%`} stopColor="#ef8a71" />
+                </linearGradient></defs>
+                <CartesianGrid vertical={false} stroke="#272b29" />
+                <XAxis dataKey="date" tickFormatter={value => format(parseISO(value), balanceChart.length > 12 ? 'MMM yy' : 'MMM d', { locale: enUS })} tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} interval="preserveStartEnd" minTickGap={42} />
+                <YAxis domain={[dataMin => Math.min(0, dataMin), dataMax => Math.max(0, dataMax)]} tickFormatter={value => money(value, true, currency)} tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} width={64} />
+                <ReferenceLine y={0} stroke="#59605a" strokeDasharray="4 4" />
+                <Tooltip content={<BalanceTooltip />} />
+                <Line type="monotone" dataKey="balance" name="Balance" stroke="url(#balanceStroke)" strokeWidth={2.5} dot={balanceChart.length === 1} activeDot={{ r: 4, strokeWidth: 3, stroke: '#111412' }} />
+              </LineChart></ResponsiveContainer>
+            </div> : <div className="empty-chart balance-empty">Add a transaction to start your balance history</div>}
+          </article>
+
           <article className="panel flow-panel">
-            <div className="panel-head"><div><span className="eyebrow">MONEY FLOW</span><h2>Income and expenses</h2></div><span className="legend"><i className="income-dot" />Income <i className="expense-dot" />Expenses</span></div>
+            <div className="panel-head"><div><span className="eyebrow">Cash flow</span><h2>Income and expenses</h2></div><span className="legend"><i className="income-dot" />Income <i className="expense-dot" />Expenses</span></div>
             <div className="chart-wrap">
               <ResponsiveContainer width="100%" height="100%"><AreaChart data={chart} margin={{ left: -18, right: 8, top: 12 }}>
-                <defs><linearGradient id="incomeFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#2b9c7b" stopOpacity={0.24}/><stop offset="1" stopColor="#2b9c7b" stopOpacity={0}/></linearGradient><linearGradient id="expenseFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#e26846" stopOpacity={0.18}/><stop offset="1" stopColor="#e26846" stopOpacity={0}/></linearGradient></defs>
-                <CartesianGrid vertical={false} stroke="#ebe8df" strokeDasharray="4 5" /><XAxis dataKey="date" tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} interval={Math.max(0, Math.floor(days / 6) - 1)} /><YAxis tickFormatter={v => money(v, true, currency)} tick={{ fill: '#8b918c', fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip content={<CustomTooltip />} />
-                <Area type="monotone" dataKey="income" stroke="#5ed39f" strokeWidth={2.5} fill="url(#incomeFill)" dot={false} activeDot={{ r: 5, strokeWidth: 3, stroke: '#0f1d17' }} />
-                <Area type="monotone" dataKey="expenses" stroke="#e47b68" strokeWidth={2.5} fill="url(#expenseFill)" dot={false} activeDot={{ r: 5, strokeWidth: 3, stroke: '#0f1d17' }} />
+                <defs><linearGradient id="incomeFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#b8d96f" stopOpacity={0.16}/><stop offset="1" stopColor="#b8d96f" stopOpacity={0}/></linearGradient><linearGradient id="expenseFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#ef8a71" stopOpacity={0.14}/><stop offset="1" stopColor="#ef8a71" stopOpacity={0}/></linearGradient></defs>
+                <CartesianGrid vertical={false} stroke="#272b29" /><XAxis dataKey="date" tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} interval={Math.max(0, Math.floor(days / 6) - 1)} /><YAxis tickFormatter={v => money(v, true, currency)} tick={{ fill: '#777d79', fontSize: 11 }} axisLine={false} tickLine={false} /><Tooltip content={<CustomTooltip />} />
+                <Area type="monotone" dataKey="income" stroke="#b8d96f" strokeWidth={2.25} fill="url(#incomeFill)" dot={false} activeDot={{ r: 4, strokeWidth: 3, stroke: '#111412' }} />
+                <Area type="monotone" dataKey="expenses" stroke="#ef8a71" strokeWidth={2.25} fill="url(#expenseFill)" dot={false} activeDot={{ r: 4, strokeWidth: 3, stroke: '#111412' }} />
               </AreaChart></ResponsiveContainer>
             </div>
           </article>
 
           <article className="panel category-panel">
-            <div className="panel-head"><div><span className="eyebrow">WHERE IT WENT</span><h2>Expenses by category</h2></div><button className="icon-button" aria-label="More options"><MoreHorizontal size={20} /></button></div>
+            <div className="panel-head"><div><span className="eyebrow">Spending</span><h2>By category</h2></div></div>
             {categories.length ? <><div className="donut-wrap"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={categories} dataKey="value" innerRadius={58} outerRadius={81} paddingAngle={3} stroke="none">{categories.map(item => <Cell key={item.name} fill={COLORS[item.name] || COLORS.Other} />)}</Pie><Tooltip formatter={value => money(Number(value ?? 0), false, currency)} /></PieChart></ResponsiveContainer><div className="donut-center"><small>TOTAL</small><b>{money(summary.expenses, true, currency)}</b></div></div><div className="category-list">{categories.slice(0, 4).map(item => <div key={item.name}><span><i style={{ background: COLORS[item.name] || COLORS.Other }} />{item.name}</span><b>{summary.expenses ? ((item.value / summary.expenses) * 100).toFixed(0) : 0}%</b></div>)}</div></> : <div className="empty-chart">No expenses in this period</div>}
           </article>
         </section>
 
         <section className="lower-grid dashboard-anchor" ref={transactionsRef}>
           <article className="panel transactions-panel">
-            <div className="panel-head"><div><span className="eyebrow">TRANSACTIONS</span><h2>Most recent</h2></div><label className="search"><Search size={16} /><input aria-label="Search transactions" placeholder="Search" value={search} onChange={e => setSearch(e.target.value)} /></label></div>
+            <div className="panel-head"><div><span className="eyebrow">Activity</span><h2>Recent transactions</h2></div><label className="search"><Search size={16} /><input aria-label="Search transactions" placeholder="Search" value={search} onChange={e => setSearch(e.target.value)} /></label></div>
             <div className="transaction-list">{recent.map(row => <div className="transaction" key={row.id}>
               <span className={`transaction-icon ${row.type}`}>{row.type === 'income' ? <ArrowUpRight size={18} /> : <ReceiptText size={18} />}</span>
-              <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}</span></div>
+              <div className="transaction-info"><b>{row.description}</b><span>{row.category} · {format(parseISO(row.date), 'MMM d', { locale: enUS })}{row.recurringExpenseId ? ' · Recurring' : ''}</span></div>
               <strong className={row.type}>{row.type === 'income' ? '+' : '−'} {money(row.amount, false, currency)}</strong>
               <button className="delete-button" onClick={() => remove(row.id)} aria-label={`Delete ${row.description}`}><Trash2 size={16} /></button>
             </div>)}</div>
           </article>
 
           <article className="panel rhythm-panel">
-            <div className="panel-head"><div><span className="eyebrow">SPENDING PACE</span><h2>Last 7 days</h2></div><span className="trend-badge">live</span></div>
-            <div className="bar-wrap"><ResponsiveContainer width="100%" height="100%"><BarChart data={dailySeries(lastDays(transactions, 7), 7)}><XAxis dataKey="date" tick={{ fill: '#7f9489', fontSize: 10 }} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip />} cursor={{ fill: '#172820' }} /><Bar dataKey="expenses" fill="#5ed39f" radius={[6, 6, 2, 2]} maxBarSize={25}/></BarChart></ResponsiveContainer></div>
+            <div className="panel-head"><div><span className="eyebrow">Spending pace</span><h2>Last 7 days</h2></div><span className="trend-badge">Daily</span></div>
+            <div className="bar-wrap"><ResponsiveContainer width="100%" height="100%"><BarChart data={dailySeries(lastDays(transactions, 7), 7)}><XAxis dataKey="date" tick={{ fill: '#777d79', fontSize: 10 }} axisLine={false} tickLine={false}/><Tooltip content={<CustomTooltip />} cursor={{ fill: '#222724' }} /><Bar dataKey="expenses" fill="#ef8a71" radius={[3, 3, 0, 0]} maxBarSize={25}/></BarChart></ResponsiveContainer></div>
             <div className="daily-avg"><span>Daily average</span><b>{money(weekSpend / 7, false, currency)}</b></div>
           </article>
+
+          {recurringSorted.length > 0 && <article className="panel recurring-panel">
+            <div className="panel-head"><div><span className="eyebrow">Automatic expenses</span><h2>Recurring monthly</h2></div><span className="trend-badge">{recurringSorted.length} active</span></div>
+            <div className="recurring-list">{recurringSorted.map(rule => <div className="recurring-row" key={rule.id}>
+              <span className="recurring-icon"><CalendarClock size={18}/></span>
+              <div><b>{rule.description}</b><span>Day {rule.dayOfMonth} · Next {format(parseISO(nextRecurringDueDate(rule)), 'MMM d', { locale: enUS })}</span></div>
+              <strong>{money(rule.amount, false, currency)}</strong>
+              <button className="delete-button" onClick={() => removeRecurring(rule.id)} aria-label={`Cancel recurring expense ${rule.description}`}><Trash2 size={16}/></button>
+            </div>)}</div>
+          </article>}
         </section>
       </main>
 
-      <button className="mobile-fab" onClick={() => setEntryOpen(true)}><Plus size={23} /></button>
-      {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} />}
-      {preferencesOpen && <PreferencesPanel currency={currency} onCurrencyChange={async next => { await secureSet('currency', next); setCurrency(next) }} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
-      {syncOpen && <SyncPanel transactions={transactions} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} onMerge={rows => setTransactions(current => mergeTransactions(current, rows))} />}
+      {entryOpen && <AddTransaction onClose={() => setEntryOpen(false)} onAdd={add} onSchedule={scheduleRecurring} />}
+      {preferencesOpen && <PreferencesPanel currency={currency} checkingUpdates={checkingUpdates} mirrorMode={mirrorMode} openRouterConfigured={openRouterConfigured} onKeyConfigured={() => setOpenRouterConfigured(true)} onCheckUpdates={checkUpdates} onCurrencyChange={async next => setCurrency(next)} onClose={() => setPreferencesOpen(false)} onNotice={message => { setToast(message); window.setTimeout(() => setToast(''), 3200) }} />}
+      {syncOpen && <SyncPanel snapshot={ledgerSnapshot} initialPeer={peer} onClose={() => setSyncOpen(false)} onPaired={setPeer} />}
       {sharedReceipt && (
         <ReceiptReview source={sharedReceipt} onClose={() => setSharedReceipt(null)} onAdd={(row, useAi) => {
           if (storageError) { setToast('Unlock private storage before importing a receipt.'); return }
@@ -481,6 +820,12 @@ export default function App() {
           setSharedReceipt(null)
         }}/>
       )}
+      {availableUpdate && <div className="update-notice" role="status">
+        <span className="update-notice-icon"><RefreshCw size={17}/></span>
+        <div><b>Update available</b><span>Leafy {availableUpdate.latestVersion} is ready to download.</span></div>
+        <button type="button" className="install-update-button" onClick={() => void installAvailableUpdate()} disabled={installingUpdate}>{installingUpdate ? `Downloading ${updateProgress}%` : 'Download and install'}</button>
+        <button type="button" className="dismiss-update" aria-label="Dismiss update notice" onClick={() => setAvailableUpdate(null)}><X size={16}/></button>
+      </div>}
       {toast && <div className="toast"><span>✓</span>{toast}</div>}
     </div>
     </CurrencyContext.Provider>

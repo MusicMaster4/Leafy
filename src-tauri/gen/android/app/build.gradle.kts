@@ -1,3 +1,4 @@
+import groovy.json.JsonSlurper
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -14,6 +15,42 @@ val tauriProperties = Properties().apply {
     }
 }
 
+val leafyReleaseKeystore = System.getenv("LEAFY_ANDROID_KEYSTORE_PATH")
+val leafyReleaseStorePassword = System.getenv("LEAFY_ANDROID_KEYSTORE_PASSWORD")
+val leafyReleaseKeyAlias = System.getenv("LEAFY_ANDROID_KEY_ALIAS")
+val leafyReleaseKeyPassword = System.getenv("LEAFY_ANDROID_KEY_PASSWORD")
+
+data class RustlsPlatformVerifier(val repository: File, val version: String)
+
+fun findRustlsPlatformVerifier(): RustlsPlatformVerifier {
+    val manifest = File(project.rootDir, "../../Cargo.toml").canonicalFile
+    val metadata = providers.exec {
+        workingDir = manifest.parentFile
+        commandLine(
+            "cargo", "metadata", "--format-version", "1",
+            "--filter-platform", "aarch64-linux-android",
+            "--manifest-path", manifest.path,
+        )
+    }.standardOutput.asText.get()
+    @Suppress("UNCHECKED_CAST")
+    val packages = (JsonSlurper().parseText(metadata) as Map<String, Any>)["packages"] as List<Map<String, Any>>
+    val verifier = packages.first { it["name"] == "rustls-platform-verifier-android" }
+    val verifierManifest = verifier["manifest_path"] as String
+    return RustlsPlatformVerifier(
+        File(File(verifierManifest).parentFile, "maven"),
+        verifier["version"] as String,
+    )
+}
+
+val rustlsPlatformVerifier = findRustlsPlatformVerifier()
+
+repositories {
+    maven {
+        url = uri(rustlsPlatformVerifier.repository)
+        metadataSources { artifact() }
+    }
+}
+
 android {
     compileSdk = 36
     namespace = "app.leafy.financas"
@@ -25,6 +62,20 @@ android {
         versionCode = tauriProperties.getProperty("tauri.android.versionCode", "1").toInt()
         versionName = tauriProperties.getProperty("tauri.android.versionName", "1.0")
     }
+    signingConfigs {
+        if (!leafyReleaseKeystore.isNullOrBlank() &&
+            !leafyReleaseStorePassword.isNullOrBlank() &&
+            !leafyReleaseKeyAlias.isNullOrBlank() &&
+            !leafyReleaseKeyPassword.isNullOrBlank()
+        ) {
+            create("leafyRelease") {
+                storeFile = file(leafyReleaseKeystore)
+                storePassword = leafyReleaseStorePassword
+                keyAlias = leafyReleaseKeyAlias
+                keyPassword = leafyReleaseKeyPassword
+            }
+        }
+    }
     buildTypes {
         getByName("debug") {
             manifestPlaceholders["usesCleartextTraffic"] = "false"
@@ -34,6 +85,7 @@ android {
             isMinifyEnabled = false
         }
         getByName("release") {
+            signingConfig = signingConfigs.findByName("leafyRelease")
             isMinifyEnabled = true
             proguardFiles(
                 *fileTree(".") { include("**/*.pro") }
@@ -58,6 +110,7 @@ rust {
 }
 
 dependencies {
+    implementation("rustls:rustls-platform-verifier:${rustlsPlatformVerifier.version}@aar")
     implementation("androidx.webkit:webkit:1.17.0")
     implementation("androidx.appcompat:appcompat:1.8.0")
     implementation("androidx.activity:activity-ktx:1.10.1")

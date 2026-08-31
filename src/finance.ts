@@ -48,6 +48,30 @@ export function dailySeries(transactions: Transaction[], days = 30) {
   })
 }
 
+export function cumulativeBalanceSeries(transactions: Transaction[]) {
+  const dailyChanges = new Map<string, number>()
+  transactions.forEach(transaction => {
+    const change = transaction.type === 'income' ? transaction.amount : -transaction.amount
+    dailyChanges.set(transaction.date, (dailyChanges.get(transaction.date) || 0) + change)
+  })
+
+  let balance = 0
+  return [...dailyChanges.entries()]
+    .sort(([dateA], [dateB]) => dateA.localeCompare(dateB))
+    .map(([date, change]) => {
+      balance += change
+      return { date, balance }
+    })
+}
+
+export function balanceZeroOffset(series: Array<{ balance: number }>) {
+  const range = series.reduce((current, point) => ({
+    min: Math.min(current.min, point.balance),
+    max: Math.max(current.max, point.balance),
+  }), { min: 0, max: 0 })
+  return range.max === range.min ? 50 : (range.max / (range.max - range.min)) * 100
+}
+
 export function categorySeries(transactions: Transaction[]) {
   const grouped = new Map<string, number>()
   transactions.filter(t => t.type === 'expense').forEach(t => grouped.set(t.category, (grouped.get(t.category) || 0) + t.amount))
