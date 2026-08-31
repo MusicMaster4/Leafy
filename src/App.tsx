@@ -23,7 +23,7 @@ import leafyIcon from '../src-tauri/icons/app-icon.svg'
 import { secureGet, secureSet } from './storage'
 import { analyzeReceipt, isSharedReceipt, type SharedReceipt } from './receipt'
 import {
-  completePairing, createPairing, forgetPeer, mergeSnapshots, parsePairing, publishSnapshot, pullFromPeer, pullHostedSnapshot,
+  completePairing, createPairing, forgetPeer, hostedSyncServerActive, mergeSnapshots, parsePairing, publishSnapshot, pullFromPeer, pullHostedSnapshot,
   rememberPeer, rememberSyncCheckpoint, resumeHostedSync, savedPeer, savedSyncCheckpoint, scanPairingCode,
   serializePairing, snapshotEquals, type LedgerSnapshot, type PairingDetails,
 } from './sync'
@@ -556,7 +556,6 @@ export default function App() {
     let active = true
     let busy = false
     let checkpointLoaded = false
-    let hostedServerReady = peer.role !== 'host'
     let baseline: LedgerSnapshot | null = null
     const sync = async () => {
       if (busy) return
@@ -567,9 +566,8 @@ export default function App() {
           checkpointLoaded = true
         }
         if (!active) return
-        if (!hostedServerReady) {
+        if (peer.role === 'host' && !await hostedSyncServerActive(peer)) {
           await resumeHostedSync(peer, ledgerSnapshotRef.current)
-          hostedServerReady = true
         }
         if (!active) return
         // A compare-and-swap retry prevents two devices that write at the same
@@ -607,7 +605,20 @@ export default function App() {
     }
     void sync()
     const timer = window.setInterval(sync, 1000)
-    return () => { active = false; window.clearInterval(timer) }
+    // Browser timers are paused or heavily throttled while a phone is in the
+    // background and while a computer sleeps. Retry immediately when either
+    // device becomes usable instead of waiting for a stale interval tick.
+    const resumeSync = () => { if (document.visibilityState !== 'hidden') void sync() }
+    window.addEventListener('focus', resumeSync)
+    window.addEventListener('online', resumeSync)
+    document.addEventListener('visibilitychange', resumeSync)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+      window.removeEventListener('focus', resumeSync)
+      window.removeEventListener('online', resumeSync)
+      document.removeEventListener('visibilitychange', resumeSync)
+    }
   }, [peer, preferencesReady, recurringReady, recurringStorageError, storageError, storageReady])
 
   const add = async (row: Transaction, useAi: boolean) => {

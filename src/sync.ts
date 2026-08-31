@@ -257,6 +257,15 @@ export async function resumeHostedSync(peer: PairingDetails, snapshot: LedgerSna
   })
 }
 
+export async function hostedSyncServerActive(peer: PairingDetails) {
+  if (peer.role !== 'host') return false
+  return invoke<boolean>('hosted_sync_server_active', {
+    endpoint: peer.endpoint,
+    token: peer.token,
+    certificate: peer.certificate,
+  })
+}
+
 function stableRecord<T extends { id: string }>(value: T | undefined) {
   return value === undefined ? '' : JSON.stringify(value)
 }

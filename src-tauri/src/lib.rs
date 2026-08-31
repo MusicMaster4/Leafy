@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::{
     net::{IpAddr, TcpListener},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
@@ -71,6 +74,7 @@ struct ActiveSyncServer {
     endpoint: String,
     token: [u8; 32],
     certificate: Vec<u8>,
+    running: Arc<AtomicBool>,
     shutdown: oneshot::Sender<()>,
 }
 
@@ -734,7 +738,8 @@ fn active_server_matches(
         .lock()
         .map_err(|_| "Could not access the private sync server")?;
     Ok(active.as_ref().is_some_and(|active| {
-        active.endpoint == endpoint
+        active.running.load(AtomicOrdering::Acquire)
+            && active.endpoint == endpoint
             && bool::from(active.token.ct_eq(token))
             && active.certificate == certificate
     }))
@@ -773,6 +778,7 @@ async fn launch_sync_server(
     let server = axum_server::from_tcp_rustls(listener, tls)
         .map_err(|error| format!("Could not start private TLS: {error}"))?;
     let (shutdown, shutdown_requested) = oneshot::channel();
+    let running = Arc::new(AtomicBool::new(true));
     {
         let mut hosted = state
             .hosted_sync
@@ -792,6 +798,7 @@ async fn launch_sync_server(
             endpoint: identity.endpoint,
             token: identity.token,
             certificate: identity.certificate,
+            running: running.clone(),
             shutdown,
         });
     }
@@ -800,6 +807,12 @@ async fn launch_sync_server(
             _ = server.serve(app.into_make_service()) => {},
             _ = shutdown_requested => {},
         }
+        // The listener can end independently of the webview (for example
+        // after a suspend/resume or a transient socket failure). Keeping this
+        // health bit with the registered identity lets the frontend restart
+        // the same pinned server instead of believing a dead listener is
+        // still serving the paired phone.
+        running.store(false, AtomicOrdering::Release);
     });
     Ok(())
 }
@@ -930,6 +943,20 @@ async fn resume_pairing_server(
         &state,
     )
     .await
+}
+
+#[tauri::command]
+fn hosted_sync_server_active(
+    endpoint: String,
+    token: String,
+    certificate: String,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let token = decode_token(&token)?;
+    let certificate = URL_SAFE_NO_PAD
+        .decode(certificate)
+        .map_err(|_| "Invalid pairing certificate")?;
+    active_server_matches(&state, &endpoint, &token, &certificate)
 }
 
 #[tauri::command]
@@ -1248,6 +1275,7 @@ pub fn run() {
             categorize_transaction,
             start_pairing_server,
             resume_pairing_server,
+            hosted_sync_server_active,
             stop_pairing_server,
             complete_pairing,
             sync_download,
@@ -1360,6 +1388,38 @@ mod security_tests {
         assert_eq!(decode_token(&token).unwrap(), [7_u8; 32]);
         assert!(decode_token(&URL_SAFE_NO_PAD.encode([7_u8; 31])).is_err());
         assert!(decode_token("not base64!").is_err());
+    }
+
+    #[test]
+    fn an_ended_sync_listener_is_not_reported_as_active() {
+        let running = Arc::new(AtomicBool::new(true));
+        let (shutdown, _shutdown_requested) = oneshot::channel();
+        let state = AppState {
+            active_sync: Arc::new(Mutex::new(Some(ActiveSyncServer {
+                endpoint: "https://192.168.1.20:49152/sync".into(),
+                token: [7_u8; 32],
+                certificate: vec![8_u8; 64],
+                running: running.clone(),
+                shutdown,
+            }))),
+            ..AppState::default()
+        };
+
+        assert!(active_server_matches(
+            &state,
+            "https://192.168.1.20:49152/sync",
+            &[7_u8; 32],
+            &[8_u8; 64],
+        )
+        .unwrap());
+        running.store(false, AtomicOrdering::Release);
+        assert!(!active_server_matches(
+            &state,
+            "https://192.168.1.20:49152/sync",
+            &[7_u8; 32],
+            &[8_u8; 64],
+        )
+        .unwrap());
     }
 
     #[tokio::test]
